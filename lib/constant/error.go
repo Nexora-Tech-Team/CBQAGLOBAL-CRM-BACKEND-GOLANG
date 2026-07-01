@@ -1,0 +1,31 @@
+package constant
+
+const (
+	RecordNotFound = "record not found"
+
+	NotAuthorize                     = "not authorized"
+	UserNotFound                     = "user not found"
+	UserHasSignedOut                 = "user has sign out"
+	PasswordIsIncorrect              = "password is incorrect"
+	EmailInvalid                     = "email address must be valid email format"
+	ValidateMinimumPassword          = "password minimum 8 character"
+	ValidateMaximumPassword          = "password maximum 16 character"
+	PasswordRegex                    = "password must contains 8 character, at least one upper and lower character, one alpha numeric & one special char"
+	EmailEmpty                       = "email is empty"
+	PasswordEmpty                    = "password is empty"
+	EmailForgotPassword              = "email Sent! Check your email to get a new password. If you don’t receive the email, be sure to check your spam folder."
+	InvalidOtp                       = "invalid OTP Code"
+	InvalidToken                     = "invalid Token"
+	NewAndConfirmPasswordMustBeMatch = "new and confirm password must be match"
+	ExportHubRegionIdConflict        = "region already taken"
+	nvalidTypeRoleManagement         = "invalid type role management"
+	RoleInUse                        = "Role is still in use"
+	RoleCodeMaximum                  = "role code maximum is 4 digit"
+	RoleNameConflict                 = "role name already taken"
+	InvalidRegionId                  = "invalid region id"
+	ValidOtp                         = "valid OTP Code"
+	RoleIdEmpty                      = "role_id is empty"
+	EmailConflict                    = "email already taken"
+	MissingToken                     = "invalid token"
+	ForBidden                        = "error 403 forbidden"
+)

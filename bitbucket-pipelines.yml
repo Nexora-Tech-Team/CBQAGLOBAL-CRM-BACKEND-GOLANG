@@ -1,0 +1,115 @@
+image: google/cloud-sdk:latest
+
+definitions:
+
+  caches:
+    docker-cache: ~/.docker
+    go: /go/pkg/mod
+
+  steps:
+    - step: &go-build-image
+        name: Build Go App and Docker Image
+        image: golang:1.19-alpine
+        caches:
+          - go
+          - docker-cache
+        services:
+          - docker
+        script:
+          - go mod tidy
+          - CGO_ENABLED=0 GOOS=linux go build -o $K8S_SERVICE_NAME
+          - export DEFAULT_IMAGE_NAME=$DOCKER_IMAGE_NAME:$BITBUCKET_COMMIT
+          - docker build --build-arg BUILD_DEVELOPMENT=develop -t $DEFAULT_IMAGE_NAME .
+          - docker save --output docker.tar $DEFAULT_IMAGE_NAME
+        artifacts:
+          - docker.tar
+
+    - step: &go-build-image-prod
+        name: Build Go App and Docker Image for Production
+        image: golang:1.19-alpine
+        caches:
+          - go
+          - docker-cache
+        services:
+          - docker
+        script:
+          - go mod tidy
+          - CGO_ENABLED=0 GOOS=linux go build -o $K8S_SERVICE_NAME_PROD
+          - export DEFAULT_IMAGE_NAME=$DOCKER_IMAGE_NAME:$BITBUCKET_COMMIT
+          - docker build --build-arg BUILD_DEVELOPMENT=prod -t $DEFAULT_IMAGE_NAME .
+          - docker save --output docker.tar $DEFAULT_IMAGE_NAME
+        artifacts:
+          - docker.tar    
+
+    - step: &push-and-deploy-staging-gcp
+        deployment: develop
+        name: Push Image and Deploy to GKE Staging
+        clone:
+          enabled: false
+        caches:
+          - docker-cache
+        services:
+          - docker
+        script:
+          - export USE_GKE_GCLOUD_AUTH_PLUGIN=TRUE
+          - export DEFAULT_IMAGE_NAME=$DOCKER_IMAGE_NAME:$BITBUCKET_COMMIT
+          - export IMAGE_NAME=$GCLOUD_GCR_REPO_URL/$GCLOUD_ACR/$DOCKER_IMAGE_NAME:$BITBUCKET_COMMIT
+          - docker load --input docker.tar
+          - docker tag $DEFAULT_IMAGE_NAME $IMAGE_NAME
+
+          # Authenticate with GCP
+          - echo $GCLOUD_API_KEYFILE > ~/.gcloud-api-key.json
+          - gcloud auth activate-service-account --key-file ~/.gcloud-api-key.json
+
+          # Login to Artifact Registry
+          - docker login -u _json_key --password-stdin https://$GCLOUD_GCR_REPO_URL < ~/.gcloud-api-key.json
+
+          # Push image
+          - docker push $IMAGE_NAME
+
+          # Connect to GKE cluster
+          - gcloud container clusters get-credentials $GCLOUD_GKE_CLUSTER --zone=$GCLOUD_ZONE --project $GCLOUD_PROJECT_ID
+
+          # Update deployment image
+          - kubectl set image deployment $K8S_SERVICE_NAME $K8S_SERVICE_NAME=$IMAGE_NAME -n $K8S_NAMESPACE
+
+    - step: &push-and-deploy-prod-gcp
+        deployment: master
+        name: Push Image and Deploy to GKE Production
+        clone:
+          enabled: false
+        caches:
+          - docker-cache
+        services:
+          - docker
+        script:
+          - export USE_GKE_GCLOUD_AUTH_PLUGIN=TRUE
+          - export DEFAULT_IMAGE_NAME=$DOCKER_IMAGE_NAME:$BITBUCKET_COMMIT
+          - export IMAGE_NAME=$GCLOUD_GCR_REPO_URL/$GCLOUD_ACR/$DOCKER_IMAGE_NAME:$BITBUCKET_COMMIT
+          - docker load --input docker.tar
+          - docker tag $DEFAULT_IMAGE_NAME $IMAGE_NAME
+
+          # Authenticate with GCP
+          - echo $GCLOUD_API_KEYFILE > ~/.gcloud-api-key.json
+          - gcloud auth activate-service-account --key-file ~/.gcloud-api-key.json
+
+          # Login to Artifact Registry
+          - docker login -u _json_key --password-stdin https://$GCLOUD_GCR_REPO_URL < ~/.gcloud-api-key.json
+
+          # Push image
+          - docker push $IMAGE_NAME
+
+          # Connect to GKE cluster
+          - gcloud container clusters get-credentials $GCLOUD_GKE_CLUSTER --zone=$GCLOUD_ZONE --project $GCLOUD_PROJECT_ID
+
+          # Update deployment image
+          - kubectl set image deployment $K8S_SERVICE_NAME_PROD $K8S_SERVICE_NAME_PROD=$IMAGE_NAME -n $K8S_NAMESPACE_PROD
+
+pipelines:
+  branches:
+    develop:
+      - step: *go-build-image
+      - step: *push-and-deploy-staging-gcp
+    master:
+      - step: *go-build-image-prod
+      - step: *push-and-deploy-prod-gcp

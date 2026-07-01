@@ -1,0 +1,53 @@
+steps:
+  - name: gcr.io/cloud-builders/git
+    args:
+      - '-c'
+      - |
+        echo "$$SSHKEY" > /root/.ssh/id_rsa
+        chmod 400 /root/.ssh/id_rsa
+        ssh-keyscan bitbucket.org > /root/.ssh/known_hosts
+    entrypoint: bash
+    secretEnv:
+      - SSHKEY
+    volumes:
+      - name: ssh
+        path: /root/.ssh
+  - name: gcr.io/cloud-builders/git
+    args:
+      - clone
+      - '--branch'
+      - develop
+      - 'git@bitbucket.org:clapping-ape/gurihmart-api.git'
+      - .
+    volumes:
+      - name: ssh
+        path: /root/.ssh
+  - name: gcr.io/cloud-builders/git
+    args:
+      - '-c'
+      - |
+        ls && git status
+    entrypoint: /bin/sh
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - '--build-arg'
+      - BUILD_DEVELOPMENT=staging
+      - '-t'
+      - 'gcr.io/dev-nkc/gurihmart-api-dev:latest'
+      - .
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - 'gcr.io/dev-nkc/gurihmart-api-dev:latest'
+  - name: gcr.io/cloud-builders/gke-deploy
+    args:
+      - run
+      - '--filename=deployment/dev.yaml'
+      - '--image=gcr.io/dev-nkc/gurihmart-api:latest'
+      - '--location=asia-southeast2-b'
+      - '--cluster=cluster-1'
+availableSecrets:
+  secretManager:
+    - versionName: projects/759870179817/secrets/ssh-bitbucket/versions/1
+      env: SSHKEY
