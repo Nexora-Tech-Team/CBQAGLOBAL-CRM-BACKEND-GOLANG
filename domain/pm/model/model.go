@@ -2,7 +2,11 @@ package model
 
 // Row is a dynamic query result row, mirroring the Java service's Map<String,Object>
 // responses for the many ad-hoc list/detail/aggregate queries in this module.
-type Row map[string]interface{}
+// Declared as an alias (not a distinct named type) so that []model.Row is
+// identical to []map[string]interface{}, which GORM's Scan special-cases for
+// raw query results — a distinct named type falls through to reflection-based
+// struct scanning and fails with "destination not a pointer".
+type Row = map[string]interface{}
 
 type TaskRequest struct {
 	Title         string  `json:"title" binding:"required"`

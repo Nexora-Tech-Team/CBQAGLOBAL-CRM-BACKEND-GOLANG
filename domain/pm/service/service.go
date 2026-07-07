@@ -2,8 +2,11 @@ package service
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"erp-cbqa-global/domain/pm/model"
 	"erp-cbqa-global/domain/pm/repository"
@@ -30,6 +33,14 @@ type ServiceInterface interface {
 	AddTicketComment(ticketID int64, req model.TicketCommentRequest, userID string) (model.Row, error)
 	TicketTemplates() ([]model.Row, error)
 	ActivityLogs() ([]model.Row, error)
+
+	CrmProjects(search string) ([]model.Row, error)
+	CrmProjectDetail(id int64) (model.Row, error)
+	TasksByCrmProject(id int64) ([]model.Row, error)
+	CreateTaskForCrmProject(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error)
+	MoveProjectTaskByKey(id, statusKey string) (model.Row, error)
+	DeleteProjectTask(id string) error
+	GanttMembers() ([]model.Row, error)
 }
 
 type pmService struct {
@@ -147,13 +158,13 @@ func (s *pmService) CreateTask(req model.TaskRequest, userID string) (model.Row,
 		return nil, err
 	}
 	fields := s.taskFields(req, statusID, statusKey)
-	fields["created_by"] = userID
+	fields["created_by"] = nilIfEmpty(userID)
 	id, err := s.Repository.InsertTask(fields)
 	if err != nil {
 		return nil, err
 	}
 	changesNil := (*string)(nil)
-	_ = s.Repository.LogActivity("created", "task", req.Title, id, "project", int64OrDefault(req.ProjectID, 0), changesNil, &userID)
+	_ = s.Repository.LogActivity("created", "task", req.Title, id, "project", int64OrDefault(req.ProjectID, 0), changesNil, strPtrOrNil(userID))
 	return s.Repository.TaskByID(id)
 }
 
@@ -180,7 +191,7 @@ func (s *pmService) UpdateTask(id int64, req model.TaskRequest, userID string) (
 		return nil, err
 	}
 	changes := fmt.Sprintf("before=%v; after=%v", before, after)
-	_ = s.Repository.LogActivity("updated", "task", req.Title, id, "project", int64OrDefault(req.ProjectID, 0), &changes, &userID)
+	_ = s.Repository.LogActivity("updated", "task", req.Title, id, "project", int64OrDefault(req.ProjectID, 0), &changes, strPtrOrNil(userID))
 	return after, nil
 }
 
@@ -206,7 +217,7 @@ func (s *pmService) MoveTaskStatus(id, statusID int64, userID string) (model.Row
 	}
 	changes := fmt.Sprintf("before=%v; after=%v", before, after)
 	projectID, _ := toInt64(after["project_id"])
-	_ = s.Repository.LogActivity("updated", "task", str(after["title"]), id, "project", projectID, &changes, &userID)
+	_ = s.Repository.LogActivity("updated", "task", str(after["title"]), id, "project", projectID, &changes, strPtrOrNil(userID))
 	return after, nil
 }
 
@@ -230,7 +241,7 @@ func (s *pmService) MoveTaskByKey(id int64, statusKey string, userID string) (mo
 		return nil, err
 	}
 	projectID, _ := toInt64(after["project_id"])
-	_ = s.Repository.LogActivity("moved", "task", str(after["title"]), id, "project", projectID, nil, &userID)
+	_ = s.Repository.LogActivity("moved", "task", str(after["title"]), id, "project", projectID, nil, strPtrOrNil(userID))
 	return after, nil
 }
 
@@ -243,7 +254,7 @@ func (s *pmService) DeleteTask(id int64, userID string) error {
 		return err
 	}
 	projectID, _ := toInt64(before["project_id"])
-	return s.Repository.LogActivity("deleted", "task", str(before["title"]), id, "project", projectID, nil, &userID)
+	return s.Repository.LogActivity("deleted", "task", str(before["title"]), id, "project", projectID, nil, strPtrOrNil(userID))
 }
 
 func (s *pmService) Tickets(status, search string) ([]model.Row, error) {
@@ -256,7 +267,7 @@ func (s *pmService) CreateTicket(req model.TicketRequest, userID string) (model.
 		"client_id":              int64OrDefault(req.ClientID, 0),
 		"project_id":             int64OrDefault(req.ProjectID, 0),
 		"ticket_type_id":         int64OrDefault(req.TicketTypeID, 0),
-		"created_by":             userID,
+		"created_by":             nilIfEmpty(userID),
 		"requested_by":           req.RequestedBy,
 		"status":                 strOrDefault(req.Status, "new"),
 		"assigned_to":            req.AssignedTo,
@@ -270,7 +281,7 @@ func (s *pmService) CreateTicket(req model.TicketRequest, userID string) (model.
 	if err != nil {
 		return nil, err
 	}
-	_ = s.Repository.LogActivity("created", "ticket", req.Title, id, "project", int64OrDefault(req.ProjectID, 0), nil, &userID)
+	_ = s.Repository.LogActivity("created", "ticket", req.Title, id, "project", int64OrDefault(req.ProjectID, 0), nil, strPtrOrNil(userID))
 	return s.Repository.TicketByID(id)
 }
 
@@ -282,7 +293,7 @@ func (s *pmService) AddTicketComment(ticketID int64, req model.TicketCommentRequ
 	fields := map[string]interface{}{
 		"ticket_id":   ticketID,
 		"description": req.Description,
-		"created_by":  userID,
+		"created_by":  nilIfEmpty(userID),
 		"files":       req.Files,
 		"is_note":     req.IsNote,
 	}
@@ -298,7 +309,7 @@ func (s *pmService) AddTicketComment(ticketID int64, req model.TicketCommentRequ
 		return nil, err
 	}
 	changes := "comment added"
-	_ = s.Repository.LogActivity("updated", "ticket", str(ticket["title"]), ticketID, "ticket_comment", id, &changes, &userID)
+	_ = s.Repository.LogActivity("updated", "ticket", str(ticket["title"]), ticketID, "ticket_comment", id, &changes, strPtrOrNil(userID))
 	return s.Repository.TicketCommentByID(id)
 }
 
@@ -308,6 +319,188 @@ func (s *pmService) TicketTemplates() ([]model.Row, error) {
 
 func (s *pmService) ActivityLogs() ([]model.Row, error) {
 	return s.Repository.ActivityLogs()
+}
+
+func (s *pmService) CrmProjects(search string) ([]model.Row, error) {
+	return s.Repository.CrmProjects(search)
+}
+
+func (s *pmService) CrmProjectDetail(id int64) (model.Row, error) {
+	row, err := s.Repository.CrmProjectByID(id)
+	if err != nil {
+		return nil, err
+	}
+	tasks, err := s.Repository.ProjectTasksByCrmProject(id)
+	if err != nil {
+		tasks = []model.Row{}
+	}
+	team, err := s.Repository.TeamByCrmProject(id)
+	if err != nil {
+		team = []model.Row{}
+	}
+	activity, err := s.Repository.ActivityByCrmProject(id)
+	if err != nil {
+		activity = []model.Row{}
+	}
+
+	// No dedicated "stage" column exists for CRM-linked PM projects yet, so
+	// derive a reasonable approximation from real task completion instead of
+	// a fixed value.
+	total := len(tasks)
+	done := 0
+	for _, t := range tasks {
+		if str(t["status"]) == "done" {
+			done++
+		}
+	}
+	progress := 0
+	if total > 0 {
+		progress = done * 100 / total
+	}
+	stage := "Planning"
+	if total > 0 {
+		if progress == 100 {
+			stage = "Closed"
+		} else {
+			stage = "Fieldwork"
+		}
+	}
+
+	result := model.Row{}
+	for k, v := range row {
+		result[k] = v
+	}
+	result["tasks"] = tasks
+	result["team"] = team
+	result["activity"] = activity
+	result["stage"] = stage
+	result["progress"] = progress
+	return result, nil
+}
+
+func (s *pmService) TasksByCrmProject(id int64) ([]model.Row, error) {
+	return s.Repository.ProjectTasksByCrmProject(id)
+}
+
+func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error) {
+	title, _ := body["title"].(string)
+	if strings.TrimSpace(title) == "" {
+		return nil, fmt.Errorf("title is required")
+	}
+	statusKeyInput := strFromAny(body["status"], "to_do")
+	statusID, err := s.Repository.ResolveStatusID(nil, statusKeyInput)
+	if err != nil {
+		return nil, err
+	}
+	statusKey, err := s.Repository.StatusKeyByID(statusID)
+	if err != nil {
+		return nil, err
+	}
+
+	id := uuid.NewString()
+	fields := map[string]interface{}{
+		"id":             id,
+		"crm_project_id": crmProjectID,
+		"title":          title,
+		"description":    strPtrFromAny(body["description"]),
+		"start_date":     parseDateTime(strPtrFromAny(body["startDate"])),
+		"deadline":       parseDateTime(strPtrFromAny(body["deadline"])),
+		"priority_id":    int64FromAny(body["priorityId"], 0),
+		"status":         statusKey,
+		"status_id":      statusID,
+		"parent_task_id": uuidPtrFromAny(body["parentTaskId"]),
+		"assigned_to":    int64PtrFromAny(body["assignedTo"]),
+		"created_by":     nilIfEmpty(userID),
+	}
+	if err := s.Repository.InsertProjectTask(fields); err != nil {
+		return nil, err
+	}
+	return s.Repository.ProjectTaskByID(id)
+}
+
+func (s *pmService) MoveProjectTaskByKey(id, statusKey string) (model.Row, error) {
+	if err := s.Repository.MoveProjectTaskByKey(id, statusKey); err != nil {
+		return nil, err
+	}
+	return s.Repository.ProjectTaskByID(id)
+}
+
+func (s *pmService) DeleteProjectTask(id string) error {
+	return s.Repository.DeleteProjectTask(id)
+}
+
+func (s *pmService) GanttMembers() ([]model.Row, error) {
+	return s.Repository.GanttMembers()
+}
+
+func strFromAny(v interface{}, fallback string) string {
+	if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+		return s
+	}
+	return fallback
+}
+
+func strPtrFromAny(v interface{}) *string {
+	s, ok := v.(string)
+	if !ok || strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return &s
+}
+
+func int64FromAny(v interface{}, fallback int64) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case string:
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
+
+// int64PtrFromAny parses the CRM project task's assignee, which is a bigint
+// `users.id` (matching GanttMembers), unlike the legacy pm_tasks board which
+// uses a musers UUID.
+func int64PtrFromAny(v interface{}) *int64 {
+	switch n := v.(type) {
+	case float64:
+		id := int64(n)
+		return &id
+	case string:
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+			return &i
+		}
+	}
+	return nil
+}
+
+func uuidPtrFromAny(v interface{}) *string {
+	s, ok := v.(string)
+	if !ok {
+		return nil
+	}
+	if _, err := uuid.Parse(s); err != nil {
+		return nil
+	}
+	return &s
+}
+
+// nilIfEmpty guards UUID columns (created_by, etc.) against an anonymous
+// (empty-string) actor, since the PM group currently runs without auth.
+func nilIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func strPtrOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 func strOrDefault(v *string, fallback string) string {

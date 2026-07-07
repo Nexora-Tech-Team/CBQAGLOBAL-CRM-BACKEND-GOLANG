@@ -34,8 +34,13 @@ func Router(db *gorm.DB, main *gin.RouterGroup) {
 		user.POST("/resend-email-verification", middleware.AuthDashboard(db), userCtrl.ResendEmailVerification)
 	}
 
+	// Frontend calls these under /v1/pm (matching the Java backend's
+	// @RequestMapping("/api/v1/pm") convention), so mount under /v1 here too.
+	// No auth middleware: this module runs against a local/standalone Go
+	// instance for now and intentionally doesn't require its own login.
 	pmCtrl := pm.PmController(db)
-	pmGroup := main.Group("pm", middleware.AuthDashboard(db))
+	v1 := main.Group("v1")
+	pmGroup := v1.Group("pm")
 	{
 		pmGroup.GET("/dashboard", pmCtrl.Dashboard)
 		pmGroup.GET("/task-statuses", pmCtrl.TaskStatuses)
@@ -55,5 +60,10 @@ func Router(db *gorm.DB, main *gin.RouterGroup) {
 		pmGroup.POST("/tickets/:ticketId/comments", pmCtrl.AddTicketComment)
 		pmGroup.GET("/ticket-templates", pmCtrl.TicketTemplates)
 		pmGroup.GET("/activity-logs", pmCtrl.ActivityLogs)
+		pmGroup.GET("/crm-projects", pmCtrl.CrmProjects)
+		pmGroup.GET("/crm-projects/:id", pmCtrl.CrmProjectDetail)
+		pmGroup.GET("/crm-projects/:id/tasks", pmCtrl.CrmProjectTasks)
+		pmGroup.POST("/crm-projects/:id/tasks", pmCtrl.CreateCrmProjectTask)
+		pmGroup.GET("/gantt/members", pmCtrl.GanttMembers)
 	}
 }

@@ -44,6 +44,18 @@ type RepositoryInterface interface {
 	TicketTemplates() ([]model.Row, error)
 	ActivityLogs() ([]model.Row, error)
 	LogActivity(action, logType, title string, typeID int64, logFor string, logForID int64, changes *string, createdBy *string) error
+
+	// CRM-project-linked task board (real `projects` table, Advisory/Audit Program services).
+	CrmProjects(search string) ([]model.Row, error)
+	CrmProjectByID(id int64) (model.Row, error)
+	ProjectTasksByCrmProject(crmProjectID int64) ([]model.Row, error)
+	TeamByCrmProject(crmProjectID int64) ([]model.Row, error)
+	ActivityByCrmProject(crmProjectID int64) ([]model.Row, error)
+	InsertProjectTask(fields map[string]interface{}) error
+	ProjectTaskByID(id string) (model.Row, error)
+	MoveProjectTaskByKey(id, statusKey string) error
+	DeleteProjectTask(id string) error
+	GanttMembers() ([]model.Row, error)
 }
 
 type repository struct {
@@ -237,7 +249,7 @@ func (r *repository) Tasks(search string, projectID *int64, assignedTo string) (
 		WHERE t.deleted = FALSE
 		  AND (?::text IS NULL OR LOWER(t.title) LIKE ? OR LOWER(COALESCE(t.description, '')) LIKE ?)
 		  AND (?::bigint IS NULL OR t.project_id = ?)
-		  AND (?::uuid IS NULL OR t.assigned_to = ?::uuid)
+		  AND (?::bigint IS NULL OR t.assigned_to = ?::bigint)
 		ORDER BY s.sort_order ASC NULLS LAST, t.sort_order ASC, t.id DESC
 	`, s, s, s, projectID, projectID, at, at).Scan(&rows).Error
 	return rows, err
@@ -421,6 +433,174 @@ func (r *repository) LogActivity(action, logType, title string, typeID int64, lo
 		INSERT INTO pm_activity_logs (created_by, action, log_type, log_type_title, log_type_id, changes, log_for, log_for_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, createdBy, action, logType, title, typeID, changes, logFor, logForID).Error
+}
+
+func (r *repository) CrmProjects(search string) ([]model.Row, error) {
+	s := like(search)
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT DISTINCT
+		  p.id AS crm_project_id,
+		  p.id,
+		  COALESCE(l.project_name, c.company_name) AS title,
+		  p.project_date AS start_date,
+		  p.status,
+		  p.assigned_to AS owner_name,
+		  c.company_name AS client_name,
+		  l.company_id
+		FROM projects p
+		JOIN leads l ON l.id = p.lead_id
+		JOIN companies c ON c.id = l.company_id
+		JOIN project_services ps ON ps.project_id = p.id
+		JOIN services s ON s.id = ps.service_id
+		WHERE s.name IN ('Advisory', 'Audit Program')
+		  AND (?::text IS NULL
+		       OR LOWER(COALESCE(l.project_name, c.company_name)) LIKE ?
+		       OR LOWER(c.company_name) LIKE ?)
+		ORDER BY p.project_date DESC NULLS LAST
+		LIMIT 200
+	`, s, s, s).Scan(&rows).Error
+	return rows, err
+}
+
+func (r *repository) CrmProjectByID(id int64) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT DISTINCT
+		  p.id AS crm_project_id,
+		  p.id,
+		  COALESCE(l.project_name, c.company_name) AS title,
+		  p.project_date AS start_date,
+		  p.status,
+		  c.company_name AS client_name,
+		  l.company_id,
+		  l.project_description AS scope,
+		  p.assigned_to AS owner_name
+		FROM projects p
+		JOIN leads l ON l.id = p.lead_id
+		JOIN companies c ON c.id = l.company_id
+		WHERE p.id = ?
+		LIMIT 1
+	`, id).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("project not found: %d", id)
+	}
+	return rows[0], nil
+}
+
+func (r *repository) ProjectTasksByCrmProject(crmProjectID int64) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT t.id, t.title, t.description, t.status,
+		       t.start_date, t.deadline, t.parent_task_id, t.crm_project_id,
+		       t.assigned_to, t.labels, t.points, t.priority_id, t.sort_order,
+		       t.created_at, t.updated_at,
+		       s.title AS status_title, s.key_name AS status_key, s.color AS status_color,
+		       COALESCE(TRIM(u.first_name || ' ' || u.last_name), '') AS assignee_name
+		FROM pm_project_tasks t
+		LEFT JOIN pm_task_statuses s ON s.id = t.status_id
+		LEFT JOIN users u ON u.id = t.assigned_to
+		WHERE t.deleted = FALSE AND t.crm_project_id = ?
+		ORDER BY t.parent_task_id ASC NULLS FIRST, t.sort_order ASC, t.id ASC
+	`, crmProjectID).Scan(&rows).Error
+	return rows, err
+}
+
+func (r *repository) InsertProjectTask(fields map[string]interface{}) error {
+	columns, placeholders, values := buildInsert(fields)
+	sql := fmt.Sprintf(`INSERT INTO pm_project_tasks (%s) VALUES (%s)`, columns, placeholders)
+	return r.DB.Exec(sql, values...).Error
+}
+
+func (r *repository) ProjectTaskByID(id string) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT t.id, t.title, t.description, t.status,
+		       t.start_date, t.deadline, t.parent_task_id, t.crm_project_id,
+		       t.assigned_to, t.labels, t.points, t.priority_id, t.sort_order,
+		       t.created_at, t.updated_at,
+		       s.title AS status_title, s.key_name AS status_key, s.color AS status_color
+		FROM pm_project_tasks t
+		LEFT JOIN pm_task_statuses s ON s.id = t.status_id
+		WHERE t.id = ? AND t.deleted = FALSE
+	`, id).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, errors.New("record not found")
+	}
+	return rows[0], nil
+}
+
+func (r *repository) MoveProjectTaskByKey(id, statusKey string) error {
+	return r.DB.Exec(`
+		UPDATE pm_project_tasks SET
+		  status = ?,
+		  status_id = (SELECT id FROM pm_task_statuses WHERE key_name = ? AND deleted = FALSE),
+		  status_changed_at = NOW(),
+		  updated_at = NOW()
+		WHERE id = ? AND deleted = FALSE
+	`, statusKey, statusKey, id).Error
+}
+
+func (r *repository) DeleteProjectTask(id string) error {
+	return r.DB.Exec(`UPDATE pm_project_tasks SET deleted = TRUE, updated_at = NOW() WHERE id = ?`, id).Error
+}
+
+// TeamByCrmProject derives the real project team from who's actually
+// assigned to that project's tasks — there's no dedicated project_members
+// table for CRM-linked PM tasks yet.
+func (r *repository) TeamByCrmProject(crmProjectID int64) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT u.id, TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name,
+		       COUNT(*) FILTER (WHERE t.status <> 'done') AS open_tasks,
+		       COUNT(*) AS total_tasks
+		FROM pm_project_tasks t
+		JOIN users u ON u.id = t.assigned_to
+		WHERE t.crm_project_id = ? AND t.deleted = FALSE
+		GROUP BY u.id, name
+		ORDER BY open_tasks DESC, name ASC
+	`, crmProjectID).Scan(&rows).Error
+	return rows, err
+}
+
+// ActivityByCrmProject builds a real timeline from task creation and status
+// changes — there's no dedicated activity-log table for CRM-linked PM tasks
+// yet, so this is derived from pm_project_tasks timestamps directly.
+func (r *repository) ActivityByCrmProject(crmProjectID int64) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT * FROM (
+		  SELECT t.id, 'created' AS action, t.title, t.created_at AS occurred_at
+		  FROM pm_project_tasks t
+		  WHERE t.crm_project_id = ? AND t.deleted = FALSE
+		  UNION ALL
+		  SELECT t.id, 'status_changed' AS action, (t.title || ' -> ' || t.status) AS title, t.status_changed_at AS occurred_at
+		  FROM pm_project_tasks t
+		  WHERE t.crm_project_id = ? AND t.deleted = FALSE AND t.status_changed_at IS NOT NULL
+		) events
+		ORDER BY occurred_at DESC
+		LIMIT 50
+	`, crmProjectID, crmProjectID).Scan(&rows).Error
+	return rows, err
+}
+
+func (r *repository) GanttMembers() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT id, TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')) AS name,
+		       employee_id AS code, email
+		FROM users
+		WHERE dtype = 'INTERNAL_USER'
+		ORDER BY name ASC
+		LIMIT 500
+	`).Scan(&rows).Error
+	return rows, err
 }
 
 func buildInsert(fields map[string]interface{}) (columns string, placeholders string, values []interface{}) {
