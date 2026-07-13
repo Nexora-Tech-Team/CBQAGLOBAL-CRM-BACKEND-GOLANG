@@ -52,10 +52,19 @@ type RepositoryInterface interface {
 	TeamByCrmProject(crmProjectID int64) ([]model.Row, error)
 	ActivityByCrmProject(crmProjectID int64) ([]model.Row, error)
 	InsertProjectTask(fields map[string]interface{}) error
+	UpdateProjectTask(id string, fields map[string]interface{}) error
 	ProjectTaskByID(id string) (model.Row, error)
 	MoveProjectTaskByKey(id, statusKey string) error
 	DeleteProjectTask(id string) error
 	GanttMembers() ([]model.Row, error)
+
+	// Timesheets — IT Audit Timesheet page, logged against CRM projects.
+	Timesheets(search string, userID, crmProjectID *int64, status string, from, to *string) ([]model.Row, error)
+	TimesheetSummary(userID *int64) (model.Row, error)
+	TimesheetByID(id int64) (model.Row, error)
+	InsertTimesheet(fields map[string]interface{}) (int64, error)
+	UpdateTimesheetStatus(id int64, status string, approvedBy *int64) error
+	DeleteTimesheet(id int64) error
 }
 
 type repository struct {
@@ -515,6 +524,13 @@ func (r *repository) InsertProjectTask(fields map[string]interface{}) error {
 	return r.DB.Exec(sql, values...).Error
 }
 
+func (r *repository) UpdateProjectTask(id string, fields map[string]interface{}) error {
+	set, values := buildUpdate(fields)
+	values = append(values, id)
+	sql := fmt.Sprintf(`UPDATE pm_project_tasks SET %s, updated_at = NOW() WHERE id = ? AND deleted = FALSE`, set)
+	return r.DB.Exec(sql, values...).Error
+}
+
 func (r *repository) ProjectTaskByID(id string) (model.Row, error) {
 	var rows []model.Row
 	err := r.DB.Raw(`
@@ -601,6 +617,111 @@ func (r *repository) GanttMembers() ([]model.Row, error) {
 		LIMIT 500
 	`).Scan(&rows).Error
 	return rows, err
+}
+
+func (r *repository) Timesheets(search string, userID, crmProjectID *int64, status string, from, to *string) ([]model.Row, error) {
+	s := like(search)
+	st := blankToNil(status)
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT
+		  ts.id, ts.crm_project_id, ts.task_id, ts.user_id, ts.work_date, ts.hours,
+		  ts.description, ts.status, ts.approved_by, ts.approved_at, ts.created_at, ts.updated_at,
+		  COALESCE(l.project_name, c.company_name) AS project_title,
+		  TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS member_name,
+		  t.title AS task_title
+		FROM pm_timesheets ts
+		LEFT JOIN projects p ON p.id = ts.crm_project_id
+		LEFT JOIN leads l ON l.id = p.lead_id
+		LEFT JOIN companies c ON c.id = l.company_id
+		LEFT JOIN users u ON u.id = ts.user_id
+		LEFT JOIN pm_project_tasks t ON t.id = ts.task_id
+		WHERE ts.deleted = FALSE
+		  AND (?::bigint IS NULL OR ts.user_id = ?)
+		  AND (?::bigint IS NULL OR ts.crm_project_id = ?)
+		  AND (?::text IS NULL OR ts.status = ?)
+		  AND (?::date IS NULL OR ts.work_date >= ?::date)
+		  AND (?::date IS NULL OR ts.work_date <= ?::date)
+		  AND (?::text IS NULL
+		       OR LOWER(COALESCE(l.project_name, c.company_name, '')) LIKE ?
+		       OR LOWER(COALESCE(t.title, '')) LIKE ?
+		       OR LOWER(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, ''))) LIKE ?)
+		ORDER BY ts.work_date DESC, ts.id DESC
+		LIMIT 500
+	`, userID, userID, crmProjectID, crmProjectID, st, st, from, from, to, to, s, s, s, s).Scan(&rows).Error
+	return rows, err
+}
+
+func (r *repository) TimesheetSummary(userID *int64) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT
+		  COALESCE(SUM(hours) FILTER (WHERE work_date = CURRENT_DATE), 0) AS hours_today,
+		  COALESCE(SUM(hours) FILTER (WHERE work_date >= date_trunc('week', CURRENT_DATE)::date), 0) AS weekly_hours,
+		  COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+		  COUNT(*) FILTER (WHERE status = 'approved') AS approved_count
+		FROM pm_timesheets
+		WHERE deleted = FALSE
+		  AND (?::bigint IS NULL OR user_id = ?)
+	`, userID, userID).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return model.Row{}, nil
+	}
+	return rows[0], nil
+}
+
+func (r *repository) TimesheetByID(id int64) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT
+		  ts.id, ts.crm_project_id, ts.task_id, ts.user_id, ts.work_date, ts.hours,
+		  ts.description, ts.status, ts.approved_by, ts.approved_at, ts.created_at, ts.updated_at,
+		  COALESCE(l.project_name, c.company_name) AS project_title,
+		  TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS member_name,
+		  t.title AS task_title
+		FROM pm_timesheets ts
+		LEFT JOIN projects p ON p.id = ts.crm_project_id
+		LEFT JOIN leads l ON l.id = p.lead_id
+		LEFT JOIN companies c ON c.id = l.company_id
+		LEFT JOIN users u ON u.id = ts.user_id
+		LEFT JOIN pm_project_tasks t ON t.id = ts.task_id
+		WHERE ts.id = ? AND ts.deleted = FALSE
+	`, id).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, errors.New("record not found")
+	}
+	return rows[0], nil
+}
+
+func (r *repository) InsertTimesheet(fields map[string]interface{}) (int64, error) {
+	columns, placeholders, values := buildInsert(fields)
+	var id int64
+	sql := fmt.Sprintf(`INSERT INTO pm_timesheets (%s) VALUES (%s) RETURNING id`, columns, placeholders)
+	if err := r.DB.Raw(sql, values...).Scan(&id).Error; err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func (r *repository) UpdateTimesheetStatus(id int64, status string, approvedBy *int64) error {
+	return r.DB.Exec(`
+		UPDATE pm_timesheets SET
+		  status = ?,
+		  approved_by = ?,
+		  approved_at = CASE WHEN ? = 'pending' THEN NULL ELSE NOW() END,
+		  updated_at = NOW()
+		WHERE id = ? AND deleted = FALSE
+	`, status, approvedBy, status, id).Error
+}
+
+func (r *repository) DeleteTimesheet(id int64) error {
+	return r.DB.Exec(`UPDATE pm_timesheets SET deleted = TRUE, updated_at = NOW() WHERE id = ?`, id).Error
 }
 
 func buildInsert(fields map[string]interface{}) (columns string, placeholders string, values []interface{}) {

@@ -54,3 +54,17 @@ type TicketCommentRequest struct {
 	Files       *string `json:"files"`
 	IsNote      bool    `json:"is_note"`
 }
+
+type TimesheetRequest struct {
+	CrmProjectID int64   `json:"crm_project_id" binding:"required"`
+	TaskID       *string `json:"task_id"`
+	UserID       *int64  `json:"user_id"`
+	WorkDate     string  `json:"work_date" binding:"required"`
+	Hours        float64 `json:"hours" binding:"required"`
+	Description  *string `json:"description"`
+}
+
+type TimesheetStatusRequest struct {
+	Status     string `json:"status" binding:"required"`
+	ApprovedBy *int64 `json:"approved_by"`
+}

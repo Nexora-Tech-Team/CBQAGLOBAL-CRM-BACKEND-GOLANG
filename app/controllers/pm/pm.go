@@ -138,22 +138,37 @@ func (pc *pmController) CreateTask(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, data)
 }
 
+// UpdateTask handles PUT /tasks/:id for both the legacy int64-keyed pm_tasks
+// board and the new UUID-keyed pm_project_tasks (CRM project) board, mirroring
+// the same dual-dispatch pattern as MoveTaskByKey/DeleteTask below.
 func (pc *pmController) UpdateTask(ctx *gin.Context) {
-	id, ok := parseIDParam(ctx, "id")
-	if !ok {
+	idParam := ctx.Param("id")
+	if id, convErr := strconv.ParseInt(idParam, 10, 64); convErr == nil {
+		var req model.TaskRequest
+		if err := ctx.ShouldBindJSON(&req); err != nil {
+			response.Error(ctx, http.StatusBadRequest, err.Error())
+			return
+		}
+		userID, err := currentUserID(ctx)
+		if err != nil {
+			response.Error(ctx, http.StatusUnauthorized, err.Error())
+			return
+		}
+		data, err := pc.Service.UpdateTask(id, req, userID)
+		if err != nil {
+			response.Error(ctx, http.StatusInternalServerError, err.Error())
+			return
+		}
+		ctx.JSON(http.StatusOK, data)
 		return
 	}
-	var req model.TaskRequest
-	if err := ctx.ShouldBindJSON(&req); err != nil {
+
+	var body map[string]interface{}
+	if err := ctx.ShouldBindJSON(&body); err != nil {
 		response.Error(ctx, http.StatusBadRequest, err.Error())
 		return
 	}
-	userID, err := currentUserID(ctx)
-	if err != nil {
-		response.Error(ctx, http.StatusUnauthorized, err.Error())
-		return
-	}
-	data, err := pc.Service.UpdateTask(id, req, userID)
+	data, err := pc.Service.UpdateProjectTask(idParam, body)
 	if err != nil {
 		response.Error(ctx, http.StatusInternalServerError, err.Error())
 		return
@@ -399,4 +414,63 @@ func (pc *pmController) ActivityLogs(ctx *gin.Context) {
 		return
 	}
 	ctx.JSON(http.StatusOK, data)
+}
+
+func (pc *pmController) Timesheets(ctx *gin.Context) {
+	data, err := pc.Service.Timesheets(
+		ctx.Query("search"),
+		parseInt64Query(ctx, "user_id"),
+		parseInt64Query(ctx, "crm_project_id"),
+		ctx.Query("status"),
+		ctx.Query("period"),
+	)
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (pc *pmController) CreateTimesheet(ctx *gin.Context) {
+	var req model.TimesheetRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, err := pc.Service.CreateTimesheet(req)
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (pc *pmController) UpdateTimesheetStatus(ctx *gin.Context) {
+	id, ok := parseIDParam(ctx, "id")
+	if !ok {
+		return
+	}
+	var req model.TimesheetStatusRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, err := pc.Service.UpdateTimesheetStatus(id, req.Status, req.ApprovedBy)
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (pc *pmController) DeleteTimesheet(ctx *gin.Context) {
+	id, ok := parseIDParam(ctx, "id")
+	if !ok {
+		return
+	}
+	if err := pc.Service.DeleteTimesheet(id); err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, nil)
 }

@@ -38,9 +38,15 @@ type ServiceInterface interface {
 	CrmProjectDetail(id int64) (model.Row, error)
 	TasksByCrmProject(id int64) ([]model.Row, error)
 	CreateTaskForCrmProject(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error)
+	UpdateProjectTask(id string, body map[string]interface{}) (model.Row, error)
 	MoveProjectTaskByKey(id, statusKey string) (model.Row, error)
 	DeleteProjectTask(id string) error
 	GanttMembers() ([]model.Row, error)
+
+	Timesheets(search string, userID, crmProjectID *int64, status, period string) (model.Row, error)
+	CreateTimesheet(req model.TimesheetRequest) (model.Row, error)
+	UpdateTimesheetStatus(id int64, status string, approvedBy *int64) (model.Row, error)
+	DeleteTimesheet(id int64) error
 }
 
 type pmService struct {
@@ -418,6 +424,50 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 	return s.Repository.ProjectTaskByID(id)
 }
 
+func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (model.Row, error) {
+	fields := map[string]interface{}{}
+	if title, ok := body["title"].(string); ok && strings.TrimSpace(title) != "" {
+		fields["title"] = title
+	}
+	if _, ok := body["description"]; ok {
+		fields["description"] = strPtrFromAny(body["description"])
+	}
+	if _, ok := body["startDate"]; ok {
+		fields["start_date"] = parseDateTime(strPtrFromAny(body["startDate"]))
+	}
+	if _, ok := body["deadline"]; ok {
+		fields["deadline"] = parseDateTime(strPtrFromAny(body["deadline"]))
+	}
+	if _, ok := body["priorityId"]; ok {
+		fields["priority_id"] = int64FromAny(body["priorityId"], 0)
+	}
+	if _, ok := body["assignedTo"]; ok {
+		fields["assigned_to"] = int64PtrFromAny(body["assignedTo"])
+	}
+	if _, ok := body["parentTaskId"]; ok {
+		fields["parent_task_id"] = uuidPtrFromAny(body["parentTaskId"])
+	}
+	if statusRaw, ok := body["status"].(string); ok && strings.TrimSpace(statusRaw) != "" {
+		statusID, err := s.Repository.ResolveStatusID(nil, statusRaw)
+		if err != nil {
+			return nil, err
+		}
+		statusKey, err := s.Repository.StatusKeyByID(statusID)
+		if err != nil {
+			return nil, err
+		}
+		fields["status"] = statusKey
+		fields["status_id"] = statusID
+		fields["status_changed_at"] = time.Now().UTC()
+	}
+	if len(fields) > 0 {
+		if err := s.Repository.UpdateProjectTask(id, fields); err != nil {
+			return nil, err
+		}
+	}
+	return s.Repository.ProjectTaskByID(id)
+}
+
 func (s *pmService) MoveProjectTaskByKey(id, statusKey string) (model.Row, error) {
 	if err := s.Repository.MoveProjectTaskByKey(id, statusKey); err != nil {
 		return nil, err
@@ -431,6 +481,89 @@ func (s *pmService) DeleteProjectTask(id string) error {
 
 func (s *pmService) GanttMembers() ([]model.Row, error) {
 	return s.Repository.GanttMembers()
+}
+
+func periodRange(period string) (*string, *string) {
+	now := time.Now().UTC()
+	switch strings.ToLower(strings.TrimSpace(period)) {
+	case "today":
+		d := now.Format("2006-01-02")
+		return &d, &d
+	case "this_week":
+		offset := int(now.Weekday()) - 1
+		if offset < 0 {
+			offset = 6
+		}
+		monday := now.AddDate(0, 0, -offset)
+		from := monday.Format("2006-01-02")
+		to := monday.AddDate(0, 0, 6).Format("2006-01-02")
+		return &from, &to
+	case "this_month":
+		from := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+		to := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+		return &from, &to
+	default:
+		return nil, nil
+	}
+}
+
+func (s *pmService) Timesheets(search string, userID, crmProjectID *int64, status, period string) (model.Row, error) {
+	from, to := periodRange(period)
+	entries, err := s.Repository.Timesheets(search, userID, crmProjectID, status, from, to)
+	if err != nil {
+		return nil, err
+	}
+	summary, err := s.Repository.TimesheetSummary(userID)
+	if err != nil {
+		return nil, err
+	}
+	return model.Row{"entries": entries, "summary": summary}, nil
+}
+
+func (s *pmService) CreateTimesheet(req model.TimesheetRequest) (model.Row, error) {
+	if req.Hours <= 0 {
+		return nil, fmt.Errorf("hours must be greater than 0")
+	}
+	workDate := parseDateTime(&req.WorkDate)
+	if workDate == nil {
+		return nil, fmt.Errorf("invalid work_date: %s", req.WorkDate)
+	}
+	var taskID interface{}
+	if req.TaskID != nil {
+		if _, err := uuid.Parse(*req.TaskID); err == nil {
+			taskID = *req.TaskID
+		}
+	}
+	fields := map[string]interface{}{
+		"crm_project_id": req.CrmProjectID,
+		"task_id":        taskID,
+		"user_id":        req.UserID,
+		"work_date":      workDate.Format("2006-01-02"),
+		"hours":          req.Hours,
+		"description":    req.Description,
+		"status":         "pending",
+		"created_by":     req.UserID,
+	}
+	id, err := s.Repository.InsertTimesheet(fields)
+	if err != nil {
+		return nil, err
+	}
+	return s.Repository.TimesheetByID(id)
+}
+
+func (s *pmService) UpdateTimesheetStatus(id int64, status string, approvedBy *int64) (model.Row, error) {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status != "pending" && status != "approved" && status != "rejected" {
+		return nil, fmt.Errorf("invalid status: %s", status)
+	}
+	if err := s.Repository.UpdateTimesheetStatus(id, status, approvedBy); err != nil {
+		return nil, err
+	}
+	return s.Repository.TimesheetByID(id)
+}
+
+func (s *pmService) DeleteTimesheet(id int64) error {
+	return s.Repository.DeleteTimesheet(id)
 }
 
 func strFromAny(v interface{}, fallback string) string {

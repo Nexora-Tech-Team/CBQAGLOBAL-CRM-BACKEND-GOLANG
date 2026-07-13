@@ -65,5 +65,9 @@ func Router(db *gorm.DB, main *gin.RouterGroup) {
 		pmGroup.GET("/crm-projects/:id/tasks", pmCtrl.CrmProjectTasks)
 		pmGroup.POST("/crm-projects/:id/tasks", pmCtrl.CreateCrmProjectTask)
 		pmGroup.GET("/gantt/members", pmCtrl.GanttMembers)
+		pmGroup.GET("/timesheets", pmCtrl.Timesheets)
+		pmGroup.POST("/timesheets", pmCtrl.CreateTimesheet)
+		pmGroup.PATCH("/timesheets/:id/status", pmCtrl.UpdateTimesheetStatus)
+		pmGroup.DELETE("/timesheets/:id", pmCtrl.DeleteTimesheet)
 	}
 }
