@@ -425,6 +425,9 @@ func (s *pmService) AddCrmProjectMember(crmProjectID int64, body map[string]inte
 }
 
 func (s *pmService) UpdateCrmProjectMember(crmProjectID int64, memberID string, body map[string]interface{}) (model.Row, error) {
+	if !validUUID(memberID) {
+		return nil, fmt.Errorf("invalid member id")
+	}
 	fields := map[string]interface{}{}
 	if _, ok := body["role"]; ok {
 		fields["role"] = strPtrFromAny(body["role"])
@@ -443,6 +446,9 @@ func (s *pmService) UpdateCrmProjectMember(crmProjectID int64, memberID string, 
 }
 
 func (s *pmService) DeleteCrmProjectMember(crmProjectID int64, memberID string) error {
+	if !validUUID(memberID) {
+		return fmt.Errorf("invalid member id")
+	}
 	return s.Repository.DeleteCrmProjectMember(memberID, crmProjectID)
 }
 
@@ -486,6 +492,9 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 }
 
 func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (model.Row, error) {
+	if !validUUID(id) {
+		return nil, fmt.Errorf("invalid task id")
+	}
 	fields := map[string]interface{}{}
 	if title, ok := body["title"].(string); ok && strings.TrimSpace(title) != "" {
 		fields["title"] = title
@@ -539,6 +548,9 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 }
 
 func (s *pmService) MoveProjectTaskByKey(id, statusKey string) (model.Row, error) {
+	if !validUUID(id) {
+		return nil, fmt.Errorf("invalid task id")
+	}
 	if err := s.Repository.MoveProjectTaskByKey(id, statusKey); err != nil {
 		return nil, err
 	}
@@ -546,6 +558,9 @@ func (s *pmService) MoveProjectTaskByKey(id, statusKey string) (model.Row, error
 }
 
 func (s *pmService) DeleteProjectTask(id string) error {
+	if !validUUID(id) {
+		return fmt.Errorf("invalid task id")
+	}
 	return s.Repository.DeleteProjectTask(id)
 }
 
@@ -661,6 +676,15 @@ func int64FromAny(v interface{}, fallback int64) int64 {
 		}
 	}
 	return fallback
+}
+
+// validUUID guards against a stale/malformed id (e.g. a browser tab that
+// cached a task id from before the id-encoding bug fix) reaching Postgres as
+// a raw `WHERE id = ?` on a uuid column, which fails with a cryptic
+// "invalid input syntax for type uuid" error instead of a clean 4xx.
+func validUUID(id string) bool {
+	_, err := uuid.Parse(id)
+	return err == nil
 }
 
 func clampPercent(v int64) int64 {

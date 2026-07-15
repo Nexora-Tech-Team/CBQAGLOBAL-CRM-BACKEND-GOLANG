@@ -530,6 +530,7 @@ func (r *repository) CrmProjectByID(id int64) (model.Row, error) {
 		  p.id,
 		  COALESCE(l.project_name, c.company_name) AS title,
 		  p.project_date AS start_date,
+		  p.valid_until AS end_date,
 		  p.status,
 		  c.company_name AS client_name,
 		  l.company_id,
