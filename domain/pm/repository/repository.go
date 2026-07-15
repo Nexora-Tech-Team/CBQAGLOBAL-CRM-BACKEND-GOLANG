@@ -15,6 +15,7 @@ type RepositoryInterface interface {
 	DashboardProjectsByStatus() ([]model.Row, error)
 	DashboardTopClients() ([]model.Row, error)
 	DashboardRecentProjects() ([]model.Row, error)
+	DashboardTaskDistribution(crmProjectID, memberID *int64) (model.Row, error)
 
 	Statuses() ([]model.Row, error)
 	TasksByStatus(statusID int64) ([]model.Row, error)
@@ -57,6 +58,13 @@ type RepositoryInterface interface {
 	MoveProjectTaskByKey(id, statusKey string) error
 	DeleteProjectTask(id string) error
 	GanttMembers() ([]model.Row, error)
+
+	// Team tab CRUD (pm_crm_project_members) — explicit, project-scoped
+	// membership, replacing the old "derive from assigned tasks" heuristic.
+	CrmProjectMemberByID(id string, crmProjectID int64) (model.Row, error)
+	InsertCrmProjectMember(fields map[string]interface{}) error
+	UpdateCrmProjectMember(id string, crmProjectID int64, fields map[string]interface{}) error
+	DeleteCrmProjectMember(id string, crmProjectID int64) error
 
 	// Timesheets — IT Audit Timesheet page, logged against CRM projects.
 	Timesheets(search string, userID, crmProjectID *int64, status string, from, to *string) ([]model.Row, error)
@@ -156,6 +164,34 @@ func (r *repository) DashboardRecentProjects() ([]model.Row, error) {
 		LIMIT 8
 	`).Scan(&rows).Error
 	return rows, err
+}
+
+// DashboardTaskDistribution groups CRM-project-linked tasks (pm_project_tasks)
+// by their pm_task_statuses key_name, optionally scoped to a CRM project
+// and/or an assignee. Returns a Row keyed by key_name, e.g.
+// {"to_do": 4, "in_progress": 2, "in_review": 1, "done": 7}.
+func (r *repository) DashboardTaskDistribution(crmProjectID, memberID *int64) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT s.key_name, COUNT(t.id) AS count
+		FROM pm_task_statuses s
+		LEFT JOIN pm_project_tasks t
+		  ON t.status_id = s.id AND t.deleted = FALSE
+		  AND (?::bigint IS NULL OR t.crm_project_id = ?)
+		  AND (?::bigint IS NULL OR t.assigned_to = ?)
+		WHERE s.deleted = FALSE
+		GROUP BY s.key_name, s.sort_order
+		ORDER BY s.sort_order ASC
+	`, crmProjectID, crmProjectID, memberID, memberID).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	result := model.Row{}
+	for _, row := range rows {
+		key, _ := row["key_name"].(string)
+		result[key] = row["count"]
+	}
+	return result, nil
 }
 
 func (r *repository) Statuses() ([]model.Row, error) {
@@ -444,6 +480,11 @@ func (r *repository) LogActivity(action, logType, title string, typeID int64, lo
 	`, createdBy, action, logType, title, typeID, changes, logFor, logForID).Error
 }
 
+// CrmProjects powers the Project List page. Owner is resolved from
+// projects.cuser_id (the project's creator), not the free-text assigned_to
+// column — matching how Assignee is resolved on the Tasks tab. Updated is the
+// greatest of the project's own updated_at and its PM tasks' updated_at, so
+// the column reflects the most recent activity on the project.
 func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 	s := like(search)
 	var rows []model.Row
@@ -456,12 +497,21 @@ func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 		  p.status,
 		  p.assigned_to AS owner_name,
 		  c.company_name AS client_name,
-		  l.company_id
+		  l.company_id,
+		  l.assigned_user_id,
+		  TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS assigned_user_name,
+		  NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), '') AS owner,
+		  GREATEST(
+		    p.updated_at,
+		    (SELECT MAX(t.updated_at) FROM pm_project_tasks t WHERE t.crm_project_id = p.id AND t.deleted = FALSE)
+		  ) AS updated_at
 		FROM projects p
 		JOIN leads l ON l.id = p.lead_id
 		JOIN companies c ON c.id = l.company_id
 		JOIN project_services ps ON ps.project_id = p.id
 		JOIN services s ON s.id = ps.service_id
+		LEFT JOIN users u ON u.id = l.assigned_user_id
+		LEFT JOIN users cu ON cu.id = p.cuser_id
 		WHERE s.name IN ('Advisory', 'Audit Program')
 		  AND (?::text IS NULL
 		       OR LOWER(COALESCE(l.project_name, c.company_name)) LIKE ?
@@ -484,10 +534,13 @@ func (r *repository) CrmProjectByID(id int64) (model.Row, error) {
 		  c.company_name AS client_name,
 		  l.company_id,
 		  l.project_description AS scope,
-		  p.assigned_to AS owner_name
+		  p.assigned_to AS owner_name,
+		  NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), '') AS owner,
+		  p.updated_at
 		FROM projects p
 		JOIN leads l ON l.id = p.lead_id
 		JOIN companies c ON c.id = l.company_id
+		LEFT JOIN users cu ON cu.id = p.cuser_id
 		WHERE p.id = ?
 		LIMIT 1
 	`, id).Scan(&rows).Error
@@ -500,18 +553,34 @@ func (r *repository) CrmProjectByID(id int64) (model.Row, error) {
 	return rows[0], nil
 }
 
+// ProjectTasksByCrmProject powers both the Tasks tab list "Assignee" column
+// and the task detail popup's "Details > Assignee" field. When a task has no
+// explicit assignee (t.assigned_to), it falls back to the CRM project's
+// owner (projects.cuser_id) — the same source used for the Project List
+// "Owner" column — rather than showing a blank/Unassigned name.
+// Postgres `uuid` columns (t.id, t.parent_task_id) scan into the generic
+// map[string]interface{} Row as raw []byte, which encoding/json silently
+// base64-encodes — corrupting the id for every later PATCH/DELETE/parent
+// link. Cast every uuid column to ::text so it round-trips as plain text.
 func (r *repository) ProjectTasksByCrmProject(crmProjectID int64) ([]model.Row, error) {
 	var rows []model.Row
 	err := r.DB.Raw(`
-		SELECT t.id, t.title, t.description, t.status,
-		       t.start_date, t.deadline, t.parent_task_id, t.crm_project_id,
-		       t.assigned_to, t.labels, t.points, t.priority_id, t.sort_order,
+		SELECT t.id::text AS id, t.title, t.description, t.status,
+		       t.start_date, t.deadline, t.parent_task_id::text AS parent_task_id, t.crm_project_id,
+		       t.assigned_to, t.labels, t.points, t.priority_id, t.sort_order, t.progress_pct,
+		       t.actual_start_date, t.actual_finish_date,
 		       t.created_at, t.updated_at,
 		       s.title AS status_title, s.key_name AS status_key, s.color AS status_color,
-		       COALESCE(TRIM(u.first_name || ' ' || u.last_name), '') AS assignee_name
+		       COALESCE(
+		         NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''),
+		         NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), ''),
+		         ''
+		       ) AS assignee_name
 		FROM pm_project_tasks t
 		LEFT JOIN pm_task_statuses s ON s.id = t.status_id
 		LEFT JOIN users u ON u.id = t.assigned_to
+		LEFT JOIN projects p ON p.id = t.crm_project_id
+		LEFT JOIN users cu ON cu.id = p.cuser_id
 		WHERE t.deleted = FALSE AND t.crm_project_id = ?
 		ORDER BY t.parent_task_id ASC NULLS FIRST, t.sort_order ASC, t.id ASC
 	`, crmProjectID).Scan(&rows).Error
@@ -534,9 +603,10 @@ func (r *repository) UpdateProjectTask(id string, fields map[string]interface{})
 func (r *repository) ProjectTaskByID(id string) (model.Row, error) {
 	var rows []model.Row
 	err := r.DB.Raw(`
-		SELECT t.id, t.title, t.description, t.status,
-		       t.start_date, t.deadline, t.parent_task_id, t.crm_project_id,
-		       t.assigned_to, t.labels, t.points, t.priority_id, t.sort_order,
+		SELECT t.id::text AS id, t.title, t.description, t.status,
+		       t.start_date, t.deadline, t.parent_task_id::text AS parent_task_id, t.crm_project_id,
+		       t.assigned_to, t.labels, t.points, t.priority_id, t.sort_order, t.progress_pct,
+		       t.actual_start_date, t.actual_finish_date,
 		       t.created_at, t.updated_at,
 		       s.title AS status_title, s.key_name AS status_key, s.color AS status_color
 		FROM pm_project_tasks t
@@ -567,22 +637,71 @@ func (r *repository) DeleteProjectTask(id string) error {
 	return r.DB.Exec(`UPDATE pm_project_tasks SET deleted = TRUE, updated_at = NOW() WHERE id = ?`, id).Error
 }
 
-// TeamByCrmProject derives the real project team from who's actually
-// assigned to that project's tasks — there's no dedicated project_members
-// table for CRM-linked PM tasks yet.
+// TeamByCrmProject lists this project's explicitly-managed team
+// (pm_crm_project_members — added/removed via the Team tab CRUD), each row
+// carrying task counts scoped to this project. Every row's crm_project_id
+// filter guarantees a project only ever sees/edits its own members.
 func (r *repository) TeamByCrmProject(crmProjectID int64) ([]model.Row, error) {
 	var rows []model.Row
 	err := r.DB.Raw(`
-		SELECT u.id, TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name,
-		       COUNT(*) FILTER (WHERE t.status <> 'done') AS open_tasks,
-		       COUNT(*) AS total_tasks
-		FROM pm_project_tasks t
-		JOIN users u ON u.id = t.assigned_to
-		WHERE t.crm_project_id = ? AND t.deleted = FALSE
-		GROUP BY u.id, name
-		ORDER BY open_tasks DESC, name ASC
+		SELECT m.id::text AS id, m.crm_project_id, m.user_id, m.role, m.is_leader,
+		       TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name,
+		       u.email,
+		       COUNT(t.id) FILTER (WHERE t.status <> 'done') AS open_tasks,
+		       COUNT(t.id) AS total_tasks
+		FROM pm_crm_project_members m
+		JOIN users u ON u.id = m.user_id
+		LEFT JOIN pm_project_tasks t
+		  ON t.assigned_to = m.user_id AND t.crm_project_id = m.crm_project_id AND t.deleted = FALSE
+		WHERE m.deleted = FALSE AND m.crm_project_id = ?
+		GROUP BY m.id, m.crm_project_id, m.user_id, m.role, m.is_leader, name, u.email
+		ORDER BY m.is_leader DESC, name ASC
 	`, crmProjectID).Scan(&rows).Error
 	return rows, err
+}
+
+// CrmProjectMemberByID fetches a single team member row scoped to its
+// project — used to return the created/updated record after a CRUD write.
+func (r *repository) CrmProjectMemberByID(id string, crmProjectID int64) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT m.id::text AS id, m.crm_project_id, m.user_id, m.role, m.is_leader, m.created_at, m.updated_at,
+		       TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name,
+		       u.email
+		FROM pm_crm_project_members m
+		JOIN users u ON u.id = m.user_id
+		WHERE m.id = ? AND m.crm_project_id = ? AND m.deleted = FALSE
+	`, id, crmProjectID).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, errors.New("record not found")
+	}
+	return rows[0], nil
+}
+
+func (r *repository) InsertCrmProjectMember(fields map[string]interface{}) error {
+	columns, placeholders, values := buildInsert(fields)
+	sql := fmt.Sprintf(`INSERT INTO pm_crm_project_members (%s) VALUES (%s)`, columns, placeholders)
+	return r.DB.Exec(sql, values...).Error
+}
+
+// UpdateCrmProjectMember and DeleteCrmProjectMember both filter on
+// crm_project_id (not just id) so a member can only ever be edited/removed
+// through its own project.
+func (r *repository) UpdateCrmProjectMember(id string, crmProjectID int64, fields map[string]interface{}) error {
+	set, values := buildUpdate(fields)
+	values = append(values, id, crmProjectID)
+	sql := fmt.Sprintf(`UPDATE pm_crm_project_members SET %s, updated_at = NOW() WHERE id = ? AND crm_project_id = ? AND deleted = FALSE`, set)
+	return r.DB.Exec(sql, values...).Error
+}
+
+func (r *repository) DeleteCrmProjectMember(id string, crmProjectID int64) error {
+	return r.DB.Exec(`
+		UPDATE pm_crm_project_members SET deleted = TRUE, updated_at = NOW()
+		WHERE id = ? AND crm_project_id = ?
+	`, id, crmProjectID).Error
 }
 
 // ActivityByCrmProject builds a real timeline from task creation and status
@@ -592,11 +711,11 @@ func (r *repository) ActivityByCrmProject(crmProjectID int64) ([]model.Row, erro
 	var rows []model.Row
 	err := r.DB.Raw(`
 		SELECT * FROM (
-		  SELECT t.id, 'created' AS action, t.title, t.created_at AS occurred_at
+		  SELECT t.id::text AS id, 'created' AS action, t.title, t.created_at AS occurred_at
 		  FROM pm_project_tasks t
 		  WHERE t.crm_project_id = ? AND t.deleted = FALSE
 		  UNION ALL
-		  SELECT t.id, 'status_changed' AS action, (t.title || ' -> ' || t.status) AS title, t.status_changed_at AS occurred_at
+		  SELECT t.id::text AS id, 'status_changed' AS action, (t.title || ' -> ' || t.status) AS title, t.status_changed_at AS occurred_at
 		  FROM pm_project_tasks t
 		  WHERE t.crm_project_id = ? AND t.deleted = FALSE AND t.status_changed_at IS NOT NULL
 		) events
@@ -606,13 +725,17 @@ func (r *repository) ActivityByCrmProject(crmProjectID int64) ([]model.Row, erro
 	return rows, err
 }
 
+// GanttMembers lists internal users who actually have leads assigned to them
+// (users.id = leads.assigned_user_id), not just every active internal user —
+// this is the PM Dashboard's "Member" filter.
 func (r *repository) GanttMembers() ([]model.Row, error) {
 	var rows []model.Row
 	err := r.DB.Raw(`
-		SELECT id, TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')) AS name,
-		       employee_id AS code, email
-		FROM users
-		WHERE dtype = 'INTERNAL_USER'
+		SELECT DISTINCT u.id, TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name,
+		       u.employee_id AS code, u.email
+		FROM users u
+		INNER JOIN leads l ON l.assigned_user_id = u.id
+		WHERE u.dtype = 'INTERNAL_USER' AND (u.status IS NULL OR u.status <> '0')
 		ORDER BY name ASC
 		LIMIT 500
 	`).Scan(&rows).Error

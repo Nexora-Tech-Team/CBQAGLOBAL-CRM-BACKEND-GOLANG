@@ -57,7 +57,7 @@ func currentUserID(ctx *gin.Context) (string, error) {
 }
 
 func (pc *pmController) Dashboard(ctx *gin.Context) {
-	data, err := pc.Service.Dashboard()
+	data, err := pc.Service.Dashboard(parseInt64Query(ctx, "projectId"), parseInt64Query(ctx, "memberId"))
 	if err != nil {
 		response.Error(ctx, http.StatusInternalServerError, err.Error())
 		return
@@ -323,6 +323,74 @@ func (pc *pmController) CreateCrmProjectTask(ctx *gin.Context) {
 		return
 	}
 	ctx.JSON(http.StatusOK, data)
+}
+
+func (pc *pmController) CrmProjectMembers(ctx *gin.Context) {
+	id, ok := parseIDParam(ctx, "id")
+	if !ok {
+		return
+	}
+	data, err := pc.Service.CrmProjectMembers(id)
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (pc *pmController) AddCrmProjectMember(ctx *gin.Context) {
+	id, ok := parseIDParam(ctx, "id")
+	if !ok {
+		return
+	}
+	var body map[string]interface{}
+	if err := ctx.ShouldBindJSON(&body); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := currentUserID(ctx)
+	if err != nil {
+		response.Error(ctx, http.StatusUnauthorized, err.Error())
+		return
+	}
+	data, err := pc.Service.AddCrmProjectMember(id, body, userID)
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (pc *pmController) UpdateCrmProjectMember(ctx *gin.Context) {
+	id, ok := parseIDParam(ctx, "id")
+	if !ok {
+		return
+	}
+	memberID := ctx.Param("memberId")
+	var body map[string]interface{}
+	if err := ctx.ShouldBindJSON(&body); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, err := pc.Service.UpdateCrmProjectMember(id, memberID, body)
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (pc *pmController) DeleteCrmProjectMember(ctx *gin.Context) {
+	id, ok := parseIDParam(ctx, "id")
+	if !ok {
+		return
+	}
+	memberID := ctx.Param("memberId")
+	if err := pc.Service.DeleteCrmProjectMember(id, memberID); err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, nil)
 }
 
 func (pc *pmController) GanttMembers(ctx *gin.Context) {

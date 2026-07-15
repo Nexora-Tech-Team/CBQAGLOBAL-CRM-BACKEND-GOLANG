@@ -13,7 +13,7 @@ import (
 )
 
 type ServiceInterface interface {
-	Dashboard() (model.Row, error)
+	Dashboard(crmProjectID, memberID *int64) (model.Row, error)
 	Statuses() ([]model.Row, error)
 	Kanban() (model.Row, error)
 	Projects(search string, clientID *int64, status string) ([]model.Row, error)
@@ -43,6 +43,11 @@ type ServiceInterface interface {
 	DeleteProjectTask(id string) error
 	GanttMembers() ([]model.Row, error)
 
+	CrmProjectMembers(crmProjectID int64) ([]model.Row, error)
+	AddCrmProjectMember(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error)
+	UpdateCrmProjectMember(crmProjectID int64, memberID string, body map[string]interface{}) (model.Row, error)
+	DeleteCrmProjectMember(crmProjectID int64, memberID string) error
+
 	Timesheets(search string, userID, crmProjectID *int64, status, period string) (model.Row, error)
 	CreateTimesheet(req model.TimesheetRequest) (model.Row, error)
 	UpdateTimesheetStatus(id int64, status string, approvedBy *int64) (model.Row, error)
@@ -57,7 +62,7 @@ func Service(repo repository.RepositoryInterface) ServiceInterface {
 	return &pmService{Repository: repo}
 }
 
-func (s *pmService) Dashboard() (model.Row, error) {
+func (s *pmService) Dashboard(crmProjectID, memberID *int64) (model.Row, error) {
 	totals, err := s.Repository.DashboardTotals()
 	if err != nil {
 		return nil, err
@@ -74,6 +79,10 @@ func (s *pmService) Dashboard() (model.Row, error) {
 	if err != nil {
 		return nil, err
 	}
+	taskDistribution, err := s.Repository.DashboardTaskDistribution(crmProjectID, memberID)
+	if err != nil {
+		return nil, err
+	}
 	result := model.Row{}
 	for k, v := range totals {
 		result[k] = v
@@ -81,6 +90,7 @@ func (s *pmService) Dashboard() (model.Row, error) {
 	result["projects_by_status"] = byStatus
 	result["top_clients"] = topClients
 	result["recent_projects"] = recentProjects
+	result["taskDistribution"] = taskDistribution
 	return result, nil
 }
 
@@ -388,6 +398,54 @@ func (s *pmService) TasksByCrmProject(id int64) ([]model.Row, error) {
 	return s.Repository.ProjectTasksByCrmProject(id)
 }
 
+func (s *pmService) CrmProjectMembers(crmProjectID int64) ([]model.Row, error) {
+	return s.Repository.TeamByCrmProject(crmProjectID)
+}
+
+func (s *pmService) AddCrmProjectMember(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error) {
+	memberUserID := int64FromAny(body["userId"], 0)
+	if memberUserID == 0 {
+		return nil, fmt.Errorf("userId is required")
+	}
+	isLeader, _ := body["isLeader"].(bool)
+
+	id := uuid.NewString()
+	fields := map[string]interface{}{
+		"id":             id,
+		"crm_project_id": crmProjectID,
+		"user_id":        memberUserID,
+		"role":           strPtrFromAny(body["role"]),
+		"is_leader":      isLeader,
+		"created_by":     nilIfEmpty(userID),
+	}
+	if err := s.Repository.InsertCrmProjectMember(fields); err != nil {
+		return nil, err
+	}
+	return s.Repository.CrmProjectMemberByID(id, crmProjectID)
+}
+
+func (s *pmService) UpdateCrmProjectMember(crmProjectID int64, memberID string, body map[string]interface{}) (model.Row, error) {
+	fields := map[string]interface{}{}
+	if _, ok := body["role"]; ok {
+		fields["role"] = strPtrFromAny(body["role"])
+	}
+	if v, ok := body["isLeader"]; ok {
+		if isLeader, ok2 := v.(bool); ok2 {
+			fields["is_leader"] = isLeader
+		}
+	}
+	if len(fields) > 0 {
+		if err := s.Repository.UpdateCrmProjectMember(memberID, crmProjectID, fields); err != nil {
+			return nil, err
+		}
+	}
+	return s.Repository.CrmProjectMemberByID(memberID, crmProjectID)
+}
+
+func (s *pmService) DeleteCrmProjectMember(crmProjectID int64, memberID string) error {
+	return s.Repository.DeleteCrmProjectMember(memberID, crmProjectID)
+}
+
 func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error) {
 	title, _ := body["title"].(string)
 	if strings.TrimSpace(title) == "" {
@@ -405,18 +463,21 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 
 	id := uuid.NewString()
 	fields := map[string]interface{}{
-		"id":             id,
-		"crm_project_id": crmProjectID,
-		"title":          title,
-		"description":    strPtrFromAny(body["description"]),
-		"start_date":     parseDateTime(strPtrFromAny(body["startDate"])),
-		"deadline":       parseDateTime(strPtrFromAny(body["deadline"])),
-		"priority_id":    int64FromAny(body["priorityId"], 0),
-		"status":         statusKey,
-		"status_id":      statusID,
-		"parent_task_id": uuidPtrFromAny(body["parentTaskId"]),
-		"assigned_to":    int64PtrFromAny(body["assignedTo"]),
-		"created_by":     nilIfEmpty(userID),
+		"id":                 id,
+		"crm_project_id":     crmProjectID,
+		"title":              title,
+		"description":        strPtrFromAny(body["description"]),
+		"start_date":         parseDateTime(strPtrFromAny(body["startDate"])),
+		"deadline":           parseDateTime(strPtrFromAny(body["deadline"])),
+		"actual_start_date":  parseDateTime(strPtrFromAny(body["actualStartDate"])),
+		"actual_finish_date": parseDateTime(strPtrFromAny(body["actualFinishDate"])),
+		"priority_id":        int64FromAny(body["priorityId"], 0),
+		"progress_pct":       clampPercent(int64FromAny(body["progressPct"], 0)),
+		"status":             statusKey,
+		"status_id":          statusID,
+		"parent_task_id":     uuidPtrFromAny(body["parentTaskId"]),
+		"assigned_to":        int64PtrFromAny(body["assignedTo"]),
+		"created_by":         nilIfEmpty(userID),
 	}
 	if err := s.Repository.InsertProjectTask(fields); err != nil {
 		return nil, err
@@ -438,8 +499,17 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 	if _, ok := body["deadline"]; ok {
 		fields["deadline"] = parseDateTime(strPtrFromAny(body["deadline"]))
 	}
+	if _, ok := body["actualStartDate"]; ok {
+		fields["actual_start_date"] = parseDateTime(strPtrFromAny(body["actualStartDate"]))
+	}
+	if _, ok := body["actualFinishDate"]; ok {
+		fields["actual_finish_date"] = parseDateTime(strPtrFromAny(body["actualFinishDate"]))
+	}
 	if _, ok := body["priorityId"]; ok {
 		fields["priority_id"] = int64FromAny(body["priorityId"], 0)
+	}
+	if _, ok := body["progressPct"]; ok {
+		fields["progress_pct"] = clampPercent(int64FromAny(body["progressPct"], 0))
 	}
 	if _, ok := body["assignedTo"]; ok {
 		fields["assigned_to"] = int64PtrFromAny(body["assignedTo"])
@@ -591,6 +661,16 @@ func int64FromAny(v interface{}, fallback int64) int64 {
 		}
 	}
 	return fallback
+}
+
+func clampPercent(v int64) int64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
 }
 
 // int64PtrFromAny parses the CRM project task's assignee, which is a bigint
