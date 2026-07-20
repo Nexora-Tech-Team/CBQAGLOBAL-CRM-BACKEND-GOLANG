@@ -1,0 +1,6 @@
+[Unit]
+Description=Poll GitHub for a new Go PM API build and deploy it (one-shot)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /root/app/golang-pm/ci-pull-deploy-golang.sh

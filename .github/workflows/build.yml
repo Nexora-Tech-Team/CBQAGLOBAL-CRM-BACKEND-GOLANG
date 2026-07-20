@@ -1,0 +1,63 @@
+name: Build Go PM API
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: golang-pm-api-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build erp-cbqa-global binary
+    # Built on a GitHub-hosted runner — no self-hosted runner / org-admin
+    # required. Deployment is PULL-BASED, mirroring CBQAGLOBAL-CRM-BACKEND's
+    # deploy-production.yml: the VPS (72.60.74.35, same box that serves
+    # api-erp.cbqaglobal.co.id) runs a systemd timer that polls this
+    # workflow's latest successful run, downloads the binary artifact over
+    # HTTPS (outbound only — no inbound SSH needed), and deploys it locally.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o erp-cbqa-global .
+
+      - name: Assemble deploy bundle
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp erp-cbqa-global dist/erp-cbqa-global
+          # Migration SQL files applied by the deploy script (idempotent,
+          # IF NOT EXISTS-guarded) so schema stays in sync with the binary.
+          if [ -d db/migrate ]; then
+            mkdir -p dist/migrate
+            cp db/migrate/*.sql dist/migrate/ 2>/dev/null || true
+          fi
+          echo "${GITHUB_SHA}" > dist/sha.txt
+          echo "Bundle contents:"; ls -la dist/
+
+      - name: Upload deploy bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: golang-pm-api
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error

@@ -1,0 +1,83 @@
+# CI/CD — Go PM API (pull-based deploy)
+
+Mirrors `CBQAGLOBAL-CRM-BACKEND`'s production deploy pattern: push to `main` builds a
+binary on a GitHub-hosted runner and uploads it as an artifact; the VPS
+(`72.60.74.35`, the same box that already serves `api-erp.cbqaglobal.co.id`) pulls
+that artifact on a 2-minute systemd timer and deploys it locally. Pull-based because
+this GitHub org access is collaborator-level, not org-admin, so a self-hosted Actions
+runner cannot be registered here (same constraint documented in the Java backend's
+`CLAUDE.md`).
+
+## One-time setup on the VPS (run as root, or with sudo)
+
+```bash
+# 1. App directory
+mkdir -p /root/app/golang-pm
+cd /root/app/golang-pm
+
+# 2. GitHub token for the poller (needs Contents:Read + Actions:Read on
+#    Nexora-Tech-Team/CBQAGLOBAL-CRM-BACKEND-GOLANG). If the Java backend's
+#    ci-pull-deploy already has a token with org-wide read access, reuse it:
+cp /root/app/backend/.gh_token /root/app/golang-pm/.gh_token
+chmod 600 /root/app/golang-pm/.gh_token
+# ...otherwise generate a new fine-grained PAT scoped to this repo and place it here.
+
+# 3. Runtime .env (same DB creds this repo already ships as .env.prod — copy
+#    or recreate; PORT must be 4000 to match nginx/whatever proxies
+#    api-erp.cbqaglobal.co.id today):
+cat > /root/app/golang-pm/.env <<'EOF'
+TZ=UTC
+PORT=4000
+GIN_MODE=release
+POSTGRESQL_URL=postgresql://postgres:<PASSWORD>@72.60.74.35:5432/cbqaglobal?sslmode=disable
+EOF
+chmod 600 /root/app/golang-pm/.env
+
+# 4. Copy the deploy scripts from this repo's ops/ directory
+cp ops/ci-pull-deploy-golang.sh ops/deploy-golang.sh /root/app/golang-pm/
+chmod +x /root/app/golang-pm/ci-pull-deploy-golang.sh /root/app/golang-pm/deploy-golang.sh
+
+# 5. Install systemd units
+cp ops/cbqaglobal-golang-pm.service /etc/systemd/system/
+cp ops/ci-pull-deploy-golang.service ops/ci-pull-deploy-golang.timer /etc/systemd/system/
+systemctl daemon-reload
+
+# 6. IMPORTANT — if a Go process is already running manually (e.g. nohup) on
+#    port 4000, stop it first so systemd owns the port:
+#    pgrep -fl erp-cbqa-global   (find the manual PID, kill it, NOT with pkill)
+
+# 7. Seed the binary once manually (first run has nothing to swap into yet),
+#    then enable the service + timer:
+#    (build the binary locally or trigger the GitHub Action once, download
+#    the artifact, place it at /root/app/golang-pm/erp-cbqa-global)
+systemctl enable --now cbqaglobal-golang-pm
+systemctl enable --now ci-pull-deploy-golang.timer
+```
+
+## Verify
+
+```bash
+systemctl status cbqaglobal-golang-pm
+systemctl status ci-pull-deploy-golang.timer
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:4000/api/v1/pm/task-statuses   # expect 200
+curl -s -o /dev/null -w "%{http_code}\n" https://api-erp.cbqaglobal.co.id/api/v1/pm/task-statuses  # expect 200
+tail -f /root/app/golang-pm/ci-pull-deploy-golang.log
+```
+
+## Manual controls
+
+- Force a deploy check now: `systemctl start ci-pull-deploy-golang.service`
+- Rollback: the deploy script auto-rolls back on a failed health check; to
+  roll back manually, copy the newest file from `/root/app/golang-pm/backups/`
+  over `erp-cbqa-global` and `systemctl restart cbqaglobal-golang-pm`.
+- Watch logs: `tail -f /root/app/golang-pm/ci-pull-deploy-golang.log` and
+  `tail -f /root/app/golang-pm/service.log`
+
+## Files in this directory
+
+| File | Purpose |
+|---|---|
+| `ci-pull-deploy-golang.sh` | Polls GitHub Actions for a new successful build, downloads the artifact, calls `deploy-golang.sh` |
+| `deploy-golang.sh` | Backs up the current binary, applies new migrations, swaps the binary, restarts the service, health-checks, auto-rolls back on failure |
+| `cbqaglobal-golang-pm.service` | systemd unit that actually runs the API |
+| `ci-pull-deploy-golang.service` / `.timer` | systemd oneshot + timer that runs the poller every 2 minutes |

@@ -1,0 +1,16 @@
+[Unit]
+Description=CBQA Global - Go PM API (erp-cbqa-global)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/app/golang-pm
+ExecStart=/root/app/golang-pm/erp-cbqa-global
+EnvironmentFile=/root/app/golang-pm/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/root/app/golang-pm/service.log
+StandardError=append:/root/app/golang-pm/service.log
+
+[Install]
+WantedBy=multi-user.target
