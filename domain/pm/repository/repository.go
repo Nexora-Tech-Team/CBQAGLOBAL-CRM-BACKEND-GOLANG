@@ -726,17 +726,22 @@ func (r *repository) ActivityByCrmProject(crmProjectID int64) ([]model.Row, erro
 	return rows, err
 }
 
-// GanttMembers lists internal users who actually have leads assigned to them
-// (users.id = leads.assigned_user_id), not just every active internal user —
-// this is the PM Dashboard's "Member" filter.
+// GanttMembers lists active internal users who belong to the "IT Audit"
+// department — this is the PM module's "Member" picker (Gantt assignee +
+// Add Team Member), scoped to IT Audit since PM baru is the IT Audit Project
+// Management workspace. Previously also required the user to have a lead
+// assigned (a leftover from an older, unrelated filter), which wrongly
+// excluded real IT Audit staff (auditors) who never get leads assigned —
+// dropped that condition so department membership alone determines the list.
 func (r *repository) GanttMembers() ([]model.Row, error) {
 	var rows []model.Row
 	err := r.DB.Raw(`
 		SELECT DISTINCT u.id, TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name,
 		       u.employee_id AS code, u.email
 		FROM users u
-		INNER JOIN leads l ON l.assigned_user_id = u.id
+		INNER JOIN departements d ON d.id = u.departement_id
 		WHERE u.dtype = 'INTERNAL_USER' AND (u.status IS NULL OR u.status <> '0')
+		  AND d.name = 'IT Audit'
 		ORDER BY name ASC
 		LIMIT 500
 	`).Scan(&rows).Error
