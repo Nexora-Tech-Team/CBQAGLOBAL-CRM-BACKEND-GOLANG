@@ -569,7 +569,7 @@ func (r *repository) ProjectTasksByCrmProject(crmProjectID int64) ([]model.Row, 
 		SELECT t.id::text AS id, t.title, t.description, t.status,
 		       t.start_date, t.deadline, t.parent_task_id::text AS parent_task_id, t.crm_project_id,
 		       t.assigned_to, t.labels, t.points, t.priority_id, t.sort_order, t.progress_pct,
-		       t.actual_start_date, t.actual_finish_date,
+		       t.actual_start_date, t.actual_finish_date, t.collaborators,
 		       t.created_at, t.updated_at,
 		       s.title AS status_title, s.key_name AS status_key, s.color AS status_color,
 		       COALESCE(
@@ -607,7 +607,7 @@ func (r *repository) ProjectTaskByID(id string) (model.Row, error) {
 		SELECT t.id::text AS id, t.title, t.description, t.status,
 		       t.start_date, t.deadline, t.parent_task_id::text AS parent_task_id, t.crm_project_id,
 		       t.assigned_to, t.labels, t.points, t.priority_id, t.sort_order, t.progress_pct,
-		       t.actual_start_date, t.actual_finish_date,
+		       t.actual_start_date, t.actual_finish_date, t.collaborators,
 		       t.created_at, t.updated_at,
 		       s.title AS status_title, s.key_name AS status_key, s.color AS status_color
 		FROM pm_project_tasks t

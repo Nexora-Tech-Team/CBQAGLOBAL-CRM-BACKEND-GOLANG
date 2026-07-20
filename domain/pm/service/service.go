@@ -477,6 +477,7 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 		"deadline":           parseDateTime(strPtrFromAny(body["deadline"])),
 		"actual_start_date":  parseDateTime(strPtrFromAny(body["actualStartDate"])),
 		"actual_finish_date": parseDateTime(strPtrFromAny(body["actualFinishDate"])),
+		"collaborators":      strPtrFromAny(body["collaborators"]),
 		"priority_id":        int64FromAny(body["priorityId"], 0),
 		"progress_pct":       clampPercent(int64FromAny(body["progressPct"], 0)),
 		"status":             statusKey,
@@ -513,6 +514,9 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 	}
 	if _, ok := body["actualFinishDate"]; ok {
 		fields["actual_finish_date"] = parseDateTime(strPtrFromAny(body["actualFinishDate"]))
+	}
+	if _, ok := body["collaborators"]; ok {
+		fields["collaborators"] = strPtrFromAny(body["collaborators"])
 	}
 	if _, ok := body["priorityId"]; ok {
 		fields["priority_id"] = int64FromAny(body["priorityId"], 0)
