@@ -493,6 +493,39 @@ func (r *repository) LogActivity(action, logType, title string, typeID int64, lo
 // column — matching how Assignee is resolved on the Tasks tab. Updated is the
 // greatest of the project's own updated_at and its PM tasks' updated_at, so
 // the column reflects the most recent activity on the project.
+// taskStageJoinSQL aggregates each project's active (non-deleted) PM tasks
+// into per-status counts in one grouped pass, joined once per project — this
+// keeps the Stage computation below to a single query (no N+1 per-row task
+// lookups) for both the list and detail queries that embed it.
+const taskStageJoinSQL = `
+		LEFT JOIN (
+		  SELECT
+		    crm_project_id,
+		    COUNT(*) AS total_tasks,
+		    COUNT(*) FILTER (WHERE status = 'blocked') AS blocked_tasks,
+		    COUNT(*) FILTER (WHERE status = 'done') AS done_tasks,
+		    COUNT(*) FILTER (WHERE status = 'in_review') AS review_tasks,
+		    COUNT(*) FILTER (WHERE status = 'in_progress') AS progress_tasks
+		  FROM pm_project_tasks
+		  WHERE deleted = FALSE
+		  GROUP BY crm_project_id
+		) task_stage ON task_stage.crm_project_id = p.id`
+
+// taskStageCaseSQL derives Stage from the joined task_stage counts above.
+// Priority (highest first): Blocked > Completed > Review > Fieldwork > Planning.
+// Completed only fires once ALL active tasks are done (and at least one exists);
+// a project with zero active tasks is always Planning, regardless of any other
+// signal. This is the single source of truth for Stage — never set manually.
+const taskStageCaseSQL = `
+		  CASE
+		    WHEN COALESCE(task_stage.total_tasks, 0) = 0 THEN 'Planning'
+		    WHEN task_stage.blocked_tasks > 0 THEN 'Blocked'
+		    WHEN task_stage.done_tasks = task_stage.total_tasks THEN 'Completed'
+		    WHEN task_stage.review_tasks > 0 THEN 'Review'
+		    WHEN task_stage.progress_tasks > 0 THEN 'Fieldwork'
+		    ELSE 'Planning'
+		  END AS stage`
+
 func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 	s := like(search)
 	var rows []model.Row
@@ -511,6 +544,7 @@ func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 		  NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), '') AS owner,
 		  pm.pic_user_id,
 		  NULLIF(TRIM(COALESCE(pu.first_name, '') || ' ' || COALESCE(pu.last_name, '')), '') AS pic,
+		  `+taskStageCaseSQL+`,
 		  GREATEST(
 		    p.updated_at,
 		    (SELECT MAX(t.updated_at) FROM pm_project_tasks t WHERE t.crm_project_id = p.id AND t.deleted = FALSE)
@@ -524,6 +558,7 @@ func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 		LEFT JOIN users cu ON cu.id = p.cuser_id
 		LEFT JOIN pm_projects pm ON pm.crm_project_id = p.id AND pm.deleted = FALSE
 		LEFT JOIN users pu ON pu.id = pm.pic_user_id
+		`+taskStageJoinSQL+`
 		WHERE s.name IN ('Advisory', 'Audit Program')
 		  AND (?::text IS NULL
 		       OR LOWER(COALESCE(l.project_name, c.company_name)) LIKE ?
@@ -553,12 +588,14 @@ func (r *repository) CrmProjectByID(id int64) (model.Row, error) {
 		  p.assigned_to AS owner,
 		  pm.pic_user_id,
 		  NULLIF(TRIM(COALESCE(pu.first_name, '') || ' ' || COALESCE(pu.last_name, '')), '') AS pic,
+		  `+taskStageCaseSQL+`,
 		  p.updated_at
 		FROM projects p
 		JOIN leads l ON l.id = p.lead_id
 		JOIN companies c ON c.id = l.company_id
 		LEFT JOIN pm_projects pm ON pm.crm_project_id = p.id AND pm.deleted = FALSE
 		LEFT JOIN users pu ON pu.id = pm.pic_user_id
+		`+taskStageJoinSQL+`
 		WHERE p.id = ?
 		LIMIT 1
 	`, id).Scan(&rows).Error

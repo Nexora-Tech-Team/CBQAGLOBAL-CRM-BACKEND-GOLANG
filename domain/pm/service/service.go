@@ -396,9 +396,9 @@ func (s *pmService) CrmProjectDetail(id int64) (model.Row, error) {
 		activity = []model.Row{}
 	}
 
-	// No dedicated "stage" column exists for CRM-linked PM projects yet, so
-	// derive a reasonable approximation from real task completion instead of
-	// a fixed value.
+	// Progress is a separate metric from Stage: percentage of active tasks
+	// marked done. Stage itself comes straight from row["stage"], computed by
+	// the CrmProjectByID SQL query (task_stage CASE) — never overridden here.
 	total := len(tasks)
 	done := 0
 	for _, t := range tasks {
@@ -410,14 +410,6 @@ func (s *pmService) CrmProjectDetail(id int64) (model.Row, error) {
 	if total > 0 {
 		progress = done * 100 / total
 	}
-	stage := "Planning"
-	if total > 0 {
-		if progress == 100 {
-			stage = "Closed"
-		} else {
-			stage = "Fieldwork"
-		}
-	}
 
 	result := model.Row{}
 	for k, v := range row {
@@ -426,7 +418,6 @@ func (s *pmService) CrmProjectDetail(id int64) (model.Row, error) {
 	result["tasks"] = tasks
 	result["team"] = team
 	result["activity"] = activity
-	result["stage"] = stage
 	result["progress"] = progress
 	return result, nil
 }
