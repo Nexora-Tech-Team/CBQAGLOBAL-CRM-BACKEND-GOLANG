@@ -1,0 +1,16 @@
+[Unit]
+Description=CBQA Global - Go PM API PRODUCTION (erp-cbqa-global)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/app/golang-pm-prod
+ExecStart=/root/app/golang-pm-prod/erp-cbqa-global
+EnvironmentFile=/root/app/golang-pm-prod/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/root/app/golang-pm-prod/service.log
+StandardError=append:/root/app/golang-pm-prod/service.log
+
+[Install]
+WantedBy=multi-user.target
