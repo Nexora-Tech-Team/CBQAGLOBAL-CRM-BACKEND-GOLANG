@@ -234,7 +234,7 @@ func (pc *pmController) MoveTaskByKey(ctx *gin.Context) {
 		return
 	}
 
-	data, err := pc.Service.MoveProjectTaskByKey(idParam, statusKey)
+	data, err := pc.Service.MoveProjectTaskByKey(idParam, statusKey, body["actorUserId"])
 	if err != nil {
 		response.Error(ctx, http.StatusInternalServerError, err.Error())
 		return
@@ -243,7 +243,9 @@ func (pc *pmController) MoveTaskByKey(ctx *gin.Context) {
 }
 
 // DeleteTask handles DELETE /tasks/:id for both the legacy int64-keyed
-// pm_tasks board and the new UUID-keyed pm_project_tasks board.
+// pm_tasks board and the new UUID-keyed pm_project_tasks board. DELETE
+// requests carry no JSON body from the frontend, so the acting user (for
+// the activity log) is passed as a query param instead: ?actorUserId=67.
 func (pc *pmController) DeleteTask(ctx *gin.Context) {
 	idParam := ctx.Param("id")
 	if id, convErr := strconv.ParseInt(idParam, 10, 64); convErr == nil {
@@ -260,11 +262,22 @@ func (pc *pmController) DeleteTask(ctx *gin.Context) {
 		return
 	}
 
-	if err := pc.Service.DeleteProjectTask(idParam); err != nil {
+	if err := pc.Service.DeleteProjectTask(idParam, ctx.Query("actorUserId")); err != nil {
 		response.Error(ctx, http.StatusInternalServerError, err.Error())
 		return
 	}
 	ctx.JSON(http.StatusOK, nil)
+}
+
+// TaskActivity handles GET /tasks/:id/activity — the CRM-linked task board's
+// audit trail (Task Detail drawer's "Activity" section).
+func (pc *pmController) TaskActivity(ctx *gin.Context) {
+	data, err := pc.Service.TaskActivityLogs(ctx.Param("id"))
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
 }
 
 func (pc *pmController) CrmProjects(ctx *gin.Context) {

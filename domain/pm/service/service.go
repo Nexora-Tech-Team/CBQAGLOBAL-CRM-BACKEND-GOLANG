@@ -40,8 +40,9 @@ type ServiceInterface interface {
 	TasksByCrmProject(id int64) ([]model.Row, error)
 	CreateTaskForCrmProject(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error)
 	UpdateProjectTask(id string, body map[string]interface{}) (model.Row, error)
-	MoveProjectTaskByKey(id, statusKey string) (model.Row, error)
-	DeleteProjectTask(id string) error
+	MoveProjectTaskByKey(id, statusKey string, actorUserIDRaw interface{}) (model.Row, error)
+	DeleteProjectTask(id string, actorUserIDRaw interface{}) error
+	TaskActivityLogs(taskID string) ([]model.Row, error)
 	GanttMembers() ([]model.Row, error)
 
 	CrmProjectMembers(crmProjectID int64) ([]model.Row, error)
@@ -525,12 +526,25 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 	if err := s.Repository.InsertProjectTask(fields); err != nil {
 		return nil, err
 	}
+
+	actorUserID, actorName := s.resolveActor(actorSource(body, userID))
+	isSubtask := uuidPtrFromAny(body["parentTaskId"]) != nil
+	action, description := "created", fmt.Sprintf("%s created task: %s", actorName, title)
+	if isSubtask {
+		action, description = "subtask_created", fmt.Sprintf("%s created subtask: %s", actorName, title)
+	}
+	s.logTaskActivity(id, crmProjectID, actorUserID, actorName, action, "", nil, strPtr(title), description)
+
 	return s.Repository.ProjectTaskByID(id)
 }
 
 func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (model.Row, error) {
 	if !validUUID(id) {
 		return nil, fmt.Errorf("invalid task id")
+	}
+	before, err := s.Repository.ProjectTaskByID(id)
+	if err != nil {
+		return nil, err
 	}
 	fields := map[string]interface{}{}
 	if title, ok := body["title"].(string); ok && strings.TrimSpace(title) != "" {
@@ -584,24 +598,58 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 			return nil, err
 		}
 	}
-	return s.Repository.ProjectTaskByID(id)
+	after, err := s.Repository.ProjectTaskByID(id)
+	if err != nil {
+		return nil, err
+	}
+	actorUserID, actorName := s.resolveActor(actorSource(body, ""))
+	s.logTaskFieldChanges(id, before, after, actorUserID, actorName)
+	return after, nil
 }
 
-func (s *pmService) MoveProjectTaskByKey(id, statusKey string) (model.Row, error) {
+func (s *pmService) MoveProjectTaskByKey(id, statusKey string, actorUserIDRaw interface{}) (model.Row, error) {
 	if !validUUID(id) {
 		return nil, fmt.Errorf("invalid task id")
+	}
+	before, err := s.Repository.ProjectTaskByID(id)
+	if err != nil {
+		return nil, err
 	}
 	if err := s.Repository.MoveProjectTaskByKey(id, statusKey); err != nil {
 		return nil, err
 	}
-	return s.Repository.ProjectTaskByID(id)
+	after, err := s.Repository.ProjectTaskByID(id)
+	if err != nil {
+		return nil, err
+	}
+	actorUserID, actorName := s.resolveActor(actorUserIDRaw)
+	s.logTaskFieldChanges(id, before, after, actorUserID, actorName)
+	return after, nil
 }
 
-func (s *pmService) DeleteProjectTask(id string) error {
+func (s *pmService) DeleteProjectTask(id string, actorUserIDRaw interface{}) error {
 	if !validUUID(id) {
 		return fmt.Errorf("invalid task id")
 	}
+	before, err := s.Repository.ProjectTaskByID(id)
+	if err == nil {
+		projectID := int64FromAny(before["crm_project_id"], 0)
+		actorUserID, actorName := s.resolveActor(actorUserIDRaw)
+		title := str(before["title"])
+		// Log BEFORE the delete, per spec: never lose the delete record even
+		// though the task itself becomes invisible to ProjectTaskByID
+		// (deleted = TRUE) right after this.
+		s.logTaskActivity(id, projectID, actorUserID, actorName, "deleted", "", strPtr(title), nil,
+			fmt.Sprintf("%s deleted task: %s", actorName, title))
+	}
 	return s.Repository.DeleteProjectTask(id)
+}
+
+func (s *pmService) TaskActivityLogs(taskID string) ([]model.Row, error) {
+	if !validUUID(taskID) {
+		return nil, fmt.Errorf("invalid task id")
+	}
+	return s.Repository.TaskActivityLogs(taskID)
 }
 
 func (s *pmService) GanttMembers() ([]model.Row, error) {
@@ -840,4 +888,204 @@ func parseDateTime(v *string) *time.Time {
 		}
 	}
 	return nil
+}
+
+// ─── Task activity log helpers ─────────────────────────────────────────────
+
+var priorityLabels = map[int64]string{1: "Low", 2: "Normal", 3: "High", 4: "Critical"}
+
+func priorityLabel(v interface{}) string {
+	id, _ := toInt64(v)
+	if id == 0 {
+		if f, ok := v.(float64); ok {
+			id = int64(f)
+		}
+	}
+	if label, ok := priorityLabels[id]; ok {
+		return label
+	}
+	return "Normal"
+}
+
+// actorSource prefers an explicit actorUserId from the request body (what
+// the frontend sends, sourced from the logged-in CRM user in localStorage)
+// over the JWT-derived userID, since the PM API group currently runs
+// without enforced auth and userID is usually empty in practice.
+func actorSource(body map[string]interface{}, userID string) interface{} {
+	if v, ok := body["actorUserId"]; ok && v != nil {
+		if s, isStr := v.(string); !isStr || strings.TrimSpace(s) != "" {
+			return v
+		}
+	}
+	if strings.TrimSpace(userID) != "" {
+		return userID
+	}
+	return nil
+}
+
+// resolveActor turns an actorUserId (from actorSource, a request query
+// param, etc.) into a stored user id + a human-readable name snapshot.
+// Falls back to "System" when no actor was identified — expected for now
+// since the PM API has no enforced auth.
+func (s *pmService) resolveActor(raw interface{}) (*int64, string) {
+	uid := int64PtrFromAny(raw)
+	if uid == nil {
+		return nil, "System"
+	}
+	name, err := s.Repository.ResolveUserName(*uid)
+	if err != nil || strings.TrimSpace(name) == "" {
+		name = fmt.Sprintf("User #%d", *uid)
+	}
+	return uid, name
+}
+
+func (s *pmService) logTaskActivity(taskID string, projectID int64, actorUserID *int64, actorName, action, fieldName string, oldValue, newValue *string, description string) {
+	fields := map[string]interface{}{
+		"task_id":       taskID,
+		"project_id":    projectID,
+		"actor_user_id": actorUserID,
+		"actor_name":    actorName,
+		"action":        action,
+		"field_name":    nilIfEmptyStr(fieldName),
+		"old_value":     oldValue,
+		"new_value":     newValue,
+		"description":   description,
+	}
+	// Activity logging must never block or fail the task mutation it's
+	// attached to — swallow the error (there's nothing actionable the
+	// caller could do with a failed audit-log write anyway).
+	_ = s.Repository.InsertTaskActivityLog(fields)
+}
+
+func nilIfEmptyStr(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func strPtr(s string) *string { return &s }
+
+// formatTaskDate renders a Row's date/time value (however the driver scanned
+// it — time.Time is typical, but this tolerates strings/byte slices too) as
+// a plain calendar date for human-readable activity descriptions.
+func formatTaskDate(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case time.Time:
+		return t.Format("2006-01-02")
+	case *time.Time:
+		if t == nil {
+			return ""
+		}
+		return t.Format("2006-01-02")
+	case []byte:
+		return strings.SplitN(string(t), "T", 2)[0]
+	case string:
+		return strings.SplitN(t, "T", 2)[0]
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// taskActivityField describes one trackable column for diffing a task
+// update: how to read + format it, and the label used in the log.
+type taskActivityField struct {
+	label    string // used in field_name + description, e.g. "status"
+	value    func(row model.Row) string
+	describe func(actor, oldVal, newVal string) string
+}
+
+var taskActivityFields = []taskActivityField{
+	{
+		label: "title",
+		value: func(row model.Row) string { return str(row["title"]) },
+		describe: func(actor, oldVal, newVal string) string {
+			return fmt.Sprintf("%s renamed task from \"%s\" to \"%s\"", actor, oldVal, newVal)
+		},
+	},
+	{
+		label: "status",
+		value: func(row model.Row) string { return strFromAny(row["status_title"], str(row["status"])) },
+		describe: func(actor, oldVal, newVal string) string {
+			return fmt.Sprintf("%s changed status from %s to %s", actor, oldVal, newVal)
+		},
+	},
+	{
+		label: "assignee",
+		value: func(row model.Row) string { return strFromAny(row["assignee_name"], "Unassigned") },
+		describe: func(actor, oldVal, newVal string) string {
+			return fmt.Sprintf("%s changed assignee from %s to %s", actor, oldVal, newVal)
+		},
+	},
+	{
+		label: "progress",
+		value: func(row model.Row) string { return fmt.Sprintf("%v%%", row["progress_pct"]) },
+		describe: func(actor, oldVal, newVal string) string {
+			return fmt.Sprintf("%s updated progress from %s to %s", actor, oldVal, newVal)
+		},
+	},
+	{
+		label: "priority",
+		value: func(row model.Row) string { return priorityLabel(row["priority_id"]) },
+		describe: func(actor, oldVal, newVal string) string {
+			return fmt.Sprintf("%s changed priority from %s to %s", actor, oldVal, newVal)
+		},
+	},
+	{
+		label: "plan_start",
+		value: func(row model.Row) string { return formatTaskDate(row["start_date"]) },
+		describe: func(actor, oldVal, newVal string) string {
+			return fmt.Sprintf("%s changed plan start date from %s to %s", actor, dateOrUnset(oldVal), dateOrUnset(newVal))
+		},
+	},
+	{
+		label: "plan_finish",
+		value: func(row model.Row) string { return formatTaskDate(row["deadline"]) },
+		describe: func(actor, oldVal, newVal string) string {
+			return fmt.Sprintf("%s changed plan finish date from %s to %s", actor, dateOrUnset(oldVal), dateOrUnset(newVal))
+		},
+	},
+	{
+		label: "actual_start",
+		value: func(row model.Row) string { return formatTaskDate(row["actual_start_date"]) },
+		describe: func(actor, oldVal, newVal string) string {
+			return fmt.Sprintf("%s changed actual start date from %s to %s", actor, dateOrUnset(oldVal), dateOrUnset(newVal))
+		},
+	},
+	{
+		label: "actual_finish",
+		value: func(row model.Row) string { return formatTaskDate(row["actual_finish_date"]) },
+		describe: func(actor, oldVal, newVal string) string {
+			return fmt.Sprintf("%s changed actual finish date from %s to %s", actor, dateOrUnset(oldVal), dateOrUnset(newVal))
+		},
+	},
+}
+
+func dateOrUnset(v string) string {
+	if v == "" {
+		return "(not set)"
+	}
+	return v
+}
+
+// logTaskFieldChanges diffs before/after snapshots of a task row (both from
+// ProjectTaskByID, same shape) and writes one activity log entry per changed
+// tracked field — matches the granular examples in the spec ("changed status
+// from To Do to In progress") rather than one noisy combined entry.
+func (s *pmService) logTaskFieldChanges(taskID string, before, after model.Row, actorUserID *int64, actorName string) {
+	projectID, _ := toInt64(before["crm_project_id"])
+	if projectID == 0 {
+		projectID = int64FromAny(before["crm_project_id"], 0)
+	}
+	for _, field := range taskActivityFields {
+		oldVal := field.value(before)
+		newVal := field.value(after)
+		if oldVal == newVal {
+			continue
+		}
+		s.logTaskActivity(taskID, projectID, actorUserID, actorName, "updated", field.label,
+			strPtr(oldVal), strPtr(newVal), field.describe(actorName, oldVal, newVal))
+	}
 }

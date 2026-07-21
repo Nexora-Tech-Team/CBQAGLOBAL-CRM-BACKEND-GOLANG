@@ -54,6 +54,7 @@ func Router(db *gorm.DB, main *gin.RouterGroup) {
 		pmGroup.PATCH("/tasks/:id/status", pmCtrl.MoveTaskStatus)
 		pmGroup.PATCH("/tasks/:id/move", pmCtrl.MoveTaskByKey)
 		pmGroup.DELETE("/tasks/:id", pmCtrl.DeleteTask)
+		pmGroup.GET("/tasks/:id/activity", pmCtrl.TaskActivity)
 		pmGroup.GET("/tickets", pmCtrl.Tickets)
 		pmGroup.POST("/tickets", pmCtrl.CreateTicket)
 		pmGroup.GET("/tickets/:ticketId/comments", pmCtrl.TicketComments)

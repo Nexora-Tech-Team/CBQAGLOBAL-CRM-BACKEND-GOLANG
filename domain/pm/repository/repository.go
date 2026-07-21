@@ -61,6 +61,12 @@ type RepositoryInterface interface {
 	DeleteProjectTask(id string) error
 	GanttMembers() ([]model.Row, error)
 
+	// Task activity log (pm_task_activity_logs) — audit trail for the Task
+	// Detail drawer's "Activity" section.
+	InsertTaskActivityLog(fields map[string]interface{}) error
+	TaskActivityLogs(taskID string) ([]model.Row, error)
+	ResolveUserName(userID int64) (string, error)
+
 	// Team tab CRUD (pm_crm_project_members) — explicit, project-scoped
 	// membership, replacing the old "derive from assigned tasks" heuristic.
 	CrmProjectMemberByID(id string, crmProjectID int64) (model.Row, error)
@@ -662,9 +668,11 @@ func (r *repository) ProjectTaskByID(id string) (model.Row, error) {
 		       t.assigned_to, t.labels, t.points, t.priority_id, t.sort_order, t.progress_pct,
 		       t.actual_start_date, t.actual_finish_date, t.collaborators,
 		       t.created_at, t.updated_at,
-		       s.title AS status_title, s.key_name AS status_key, s.color AS status_color
+		       s.title AS status_title, s.key_name AS status_key, s.color AS status_color,
+		       NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS assignee_name
 		FROM pm_project_tasks t
 		LEFT JOIN pm_task_statuses s ON s.id = t.status_id
+		LEFT JOIN users u ON u.id = t.assigned_to
 		WHERE t.id = ? AND t.deleted = FALSE
 	`, id).Scan(&rows).Error
 	if err != nil {
@@ -689,6 +697,40 @@ func (r *repository) MoveProjectTaskByKey(id, statusKey string) error {
 
 func (r *repository) DeleteProjectTask(id string) error {
 	return r.DB.Exec(`UPDATE pm_project_tasks SET deleted = TRUE, updated_at = NOW() WHERE id = ?`, id).Error
+}
+
+// InsertTaskActivityLog appends one audit-trail row. Never deleted alongside
+// its task (DeleteProjectTask above is a soft delete anyway, and this table
+// has no FK to pm_project_tasks) — logging happens before the delete so the
+// "deleted" entry is always the last thing recorded for that task.
+func (r *repository) InsertTaskActivityLog(fields map[string]interface{}) error {
+	columns, placeholders, values := buildInsert(fields)
+	sql := fmt.Sprintf(`INSERT INTO pm_task_activity_logs (%s) VALUES (%s)`, columns, placeholders)
+	return r.DB.Exec(sql, values...).Error
+}
+
+// TaskActivityLogs returns a task's activity, newest first — matches the
+// project-level Activity tab's convention (ActivityByCrmProject also orders
+// DESC) so the two feel consistent.
+func (r *repository) TaskActivityLogs(taskID string) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT id, task_id::text AS task_id, project_id, actor_user_id, actor_name,
+		       action, field_name, old_value, new_value, description, created_at
+		FROM pm_task_activity_logs
+		WHERE task_id = ?
+		ORDER BY created_at DESC, id DESC
+	`, taskID).Scan(&rows).Error
+	return rows, err
+}
+
+func (r *repository) ResolveUserName(userID int64) (string, error) {
+	var name string
+	err := r.DB.Raw(`
+		SELECT NULLIF(TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')), '')
+		FROM users WHERE id = ?
+	`, userID).Scan(&name).Error
+	return name, err
 }
 
 // TeamByCrmProject lists this project's explicitly-managed team
