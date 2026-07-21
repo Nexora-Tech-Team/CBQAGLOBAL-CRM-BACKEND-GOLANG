@@ -785,16 +785,25 @@ func clampPercent(v int64) int64 {
 	return v
 }
 
-// int64PtrFromAny parses the CRM project task's assignee, which is a bigint
-// `users.id` (matching GanttMembers), unlike the legacy pm_tasks board which
-// uses a musers UUID.
+// int64PtrFromAny parses a bigint `users.id` reference (assignee, PIC,
+// activity-log actor — matching GanttMembers), unlike the legacy pm_tasks
+// board which uses a musers UUID. 0 is treated the same as "not provided":
+// Postgres SERIAL ids here always start at 1, so 0 can never be a real user,
+// but the frontend's "no selection" state for a required-number field often
+// serializes to 0 rather than omitting the key or sending null. Returning
+// &0 in that case previously reached the DB as assigned_to = 0, which
+// violates pm_project_tasks_assigned_to_fkey (500 on every save where the
+// assignee was left blank).
 func int64PtrFromAny(v interface{}) *int64 {
 	switch n := v.(type) {
 	case float64:
+		if n == 0 {
+			return nil
+		}
 		id := int64(n)
 		return &id
 	case string:
-		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil && i != 0 {
 			return &i
 		}
 	}
