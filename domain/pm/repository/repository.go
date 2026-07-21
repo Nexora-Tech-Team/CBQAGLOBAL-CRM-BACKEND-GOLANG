@@ -497,15 +497,21 @@ func (r *repository) LogActivity(action, logType, title string, typeID int64, lo
 // into per-status counts in one grouped pass, joined once per project — this
 // keeps the Stage computation below to a single query (no N+1 per-row task
 // lookups) for both the list and detail queries that embed it.
+//
+// LOWER(status) IN (...) tolerates status-key variants beyond the current
+// pm_task_statuses seed (to_do/in_progress/in_review/done) — e.g. 'completed'
+// as a synonym for 'done', or differently-cased values — without requiring a
+// migration if the Kanban's status vocabulary changes later. Verified against
+// live data (2026-07-21): only to_do/in_progress/in_review/done exist today.
 const taskStageJoinSQL = `
 		LEFT JOIN (
 		  SELECT
 		    crm_project_id,
 		    COUNT(*) AS total_tasks,
-		    COUNT(*) FILTER (WHERE status = 'blocked') AS blocked_tasks,
-		    COUNT(*) FILTER (WHERE status = 'done') AS done_tasks,
-		    COUNT(*) FILTER (WHERE status = 'in_review') AS review_tasks,
-		    COUNT(*) FILTER (WHERE status = 'in_progress') AS progress_tasks
+		    COUNT(*) FILTER (WHERE LOWER(status) = 'blocked') AS blocked_tasks,
+		    COUNT(*) FILTER (WHERE LOWER(status) IN ('done', 'completed')) AS done_tasks,
+		    COUNT(*) FILTER (WHERE LOWER(status) = 'in_review') AS review_tasks,
+		    COUNT(*) FILTER (WHERE LOWER(status) = 'in_progress') AS progress_tasks
 		  FROM pm_project_tasks
 		  WHERE deleted = FALSE
 		  GROUP BY crm_project_id
