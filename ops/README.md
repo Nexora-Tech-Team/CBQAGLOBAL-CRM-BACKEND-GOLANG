@@ -45,6 +45,44 @@ roll back manually, copy the newest file from
 `/root/app/golang-pm-prod/backups/` over `erp-cbqa-global` and
 `systemctl restart cbqaglobal-golang-pm-prod`.
 
+## Staging — dedicated PM API staging box (push-based deploy)
+
+Push to `staging` (or manual `workflow_dispatch`) →
+`.github/workflows/deploy-staging.yml` builds the binary on a
+GitHub-hosted runner, then pushes it directly to the staging box
+(`212.85.25.165`) over SSH and runs `deploy-golang-staging.sh` there
+(backup → migrate → swap binary → restart → health-check →
+auto-rollback on failure). Mirrors the production pipeline above.
+
+**Required GitHub configuration** (Settings → Environments → `staging`,
+then add these as environment secrets — never commit them):
+
+| Secret | Value |
+|---|---|
+| `STAGING_SSH_HOST` | `212.85.25.165` |
+| `STAGING_SSH_USER` | `root` |
+| `STAGING_SSH_PASSWORD` | the VPS root password |
+
+One-time server setup (mirrors the production box setup):
+
+```bash
+apt-get install -y postgresql-client
+mkdir -p /root/app/golang-pm-staging
+# .env with POSTGRESQL_URL etc. for whichever DB staging should use
+cp ops/cbqaglobal-golang-pm-staging.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now cbqaglobal-golang-pm-staging
+```
+
+Verify: `systemctl status cbqaglobal-golang-pm-staging`,
+`curl -s -o /dev/null -w '%{http_code}\n' http://212.85.25.165:4000/api/v1/pm/task-statuses`
+(expect 200). Logs: `tail -f /root/app/golang-pm-staging/service.log`.
+
+Rollback: same as production — the deploy script auto-rolls back on a
+failed health check; to roll back manually, copy the newest file from
+`/root/app/golang-pm-staging/backups/` over `erp-cbqa-global` and
+`systemctl restart cbqaglobal-golang-pm-staging`.
+
 ## Legacy — shared box pull-based deploy (72.60.74.35)
 
 Mirrors `CBQAGLOBAL-CRM-BACKEND`'s production deploy pattern: push to `main` builds a
@@ -128,3 +166,8 @@ tail -f /root/app/golang-pm/ci-pull-deploy-golang.log
 | `deploy-golang.sh` | Backs up the current binary, applies new migrations, swaps the binary, restarts the service, health-checks, auto-rolls back on failure |
 | `cbqaglobal-golang-pm.service` | systemd unit that actually runs the API |
 | `ci-pull-deploy-golang.service` / `.timer` | systemd oneshot + timer that runs the poller every 2 minutes |
+| `deploy-golang-prod.sh` | Push-based deploy script run on the production box by `deploy-production.yml` |
+| `cbqaglobal-golang-pm-prod.service` | systemd unit for the production box |
+| `nginx-api-pm-prod.cbqaglobal.co.id.conf` | nginx vhost for the production box |
+| `deploy-golang-staging.sh` | Push-based deploy script run on the staging box by `deploy-staging.yml` |
+| `cbqaglobal-golang-pm-staging.service` | systemd unit for the staging box |

@@ -1,0 +1,16 @@
+[Unit]
+Description=CBQA Global - Go PM API STAGING (erp-cbqa-global)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/app/golang-pm-staging
+ExecStart=/root/app/golang-pm-staging/erp-cbqa-global
+EnvironmentFile=/root/app/golang-pm-staging/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/root/app/golang-pm-staging/service.log
+StandardError=append:/root/app/golang-pm-staging/service.log
+
+[Install]
+WantedBy=multi-user.target

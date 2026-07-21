@@ -1,0 +1,75 @@
+name: Deploy Go PM API (staging)
+
+on:
+  push:
+    branches:
+      - staging
+  workflow_dispatch:
+
+concurrency:
+  group: golang-pm-api-deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy to staging (212.85.25.165)
+    # PUSH-BASED deploy, mirrors deploy-production.yml but targets the
+    # staging box (212.85.25.165) instead of the production box
+    # (72.60.74.36). See ops/README.md for details.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o erp-cbqa-global .
+
+      - name: Assemble deploy bundle
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp erp-cbqa-global dist/erp-cbqa-global
+          cp ops/deploy-golang-staging.sh dist/deploy-golang-staging.sh
+          if [ -d db/migrate ]; then
+            mkdir -p dist/migrate
+            cp db/migrate/*.sql dist/migrate/ 2>/dev/null || true
+          fi
+          echo "${GITHUB_SHA}" > dist/sha.txt
+          echo "Bundle contents:"; ls -la dist/
+
+      - name: Upload bundle to staging server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.STAGING_SSH_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          password: ${{ secrets.STAGING_SSH_PASSWORD }}
+          source: "dist/*"
+          target: "/root/app/golang-pm-staging/incoming"
+          strip_components: 1
+          overwrite: true
+
+      - name: Run remote deploy script
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.STAGING_SSH_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          password: ${{ secrets.STAGING_SSH_PASSWORD }}
+          script_stop: true
+          script: |
+            chmod +x /root/app/golang-pm-staging/incoming/erp-cbqa-global
+            chmod +x /root/app/golang-pm-staging/incoming/deploy-golang-staging.sh
+            bash /root/app/golang-pm-staging/incoming/deploy-golang-staging.sh /root/app/golang-pm-staging/incoming
