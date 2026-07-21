@@ -72,10 +72,9 @@ both queries so list and detail can never disagree:
 
 Real task status values in `pm_project_tasks.status` (cross-check against
 `pm_task_statuses` before trusting this list): `to_do`, `in_progress`,
-`in_review`, `done`. `blocked` is wired into the CASE and into the
-frontend's badge color helpers, but is **not yet seeded** as a selectable
-Kanban column — so the `Blocked` stage can't actually be triggered from the
-UI yet until that status becomes assignable.
+`in_review`, `blocked`, `done`. `blocked` is seeded as a selectable Kanban
+column, so moving any active task there makes the project Stage become
+`Blocked` until that task leaves the blocked status.
 
 `domain/pm/service/service.go`'s `CrmProjectDetail` used to **override** the
 SQL's `stage` with a stale 2-state approximation (`Planning`/`Fieldwork`/`Closed`

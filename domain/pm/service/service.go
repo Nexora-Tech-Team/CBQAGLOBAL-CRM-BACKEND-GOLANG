@@ -340,7 +340,32 @@ func (s *pmService) ActivityLogs() ([]model.Row, error) {
 }
 
 func (s *pmService) CrmProjects(search string) ([]model.Row, error) {
-	return s.Repository.CrmProjects(search)
+	rows, err := s.Repository.CrmProjects(search)
+	if err != nil {
+		return nil, err
+	}
+
+	// One extra flat query for every active task across every project,
+	// grouped in memory by crm_project_id — the alternative (fetch tasks
+	// per project row) is exactly the N+1 pattern this needs to avoid.
+	tasks, err := s.Repository.ActiveTaskProgressInputs()
+	if err != nil {
+		for _, row := range rows {
+			row["progress"] = int64(0)
+		}
+		return rows, nil
+	}
+	tasksByProject := make(map[int64][]model.Row, len(rows))
+	for _, t := range tasks {
+		pid, _ := toInt64(t["crm_project_id"])
+		tasksByProject[pid] = append(tasksByProject[pid], t)
+	}
+	for _, row := range rows {
+		pid, _ := toInt64(row["crm_project_id"])
+		projectTasks := tasksByProject[pid]
+		row["progress"] = projectProgressFromTasks(projectTasks, computeTaskProgress(projectTasks))
+	}
+	return rows, nil
 }
 
 // UpdateCrmProjectOverview saves the PM Overview tab's editable fields:
@@ -396,20 +421,16 @@ func (s *pmService) CrmProjectDetail(id int64) (model.Row, error) {
 		activity = []model.Row{}
 	}
 
-	// Progress is a separate metric from Stage: percentage of active tasks
-	// marked done. Stage itself comes straight from row["stage"], computed by
-	// the CrmProjectByID SQL query (task_stage CASE) — never overridden here.
-	total := len(tasks)
-	done := 0
-	for _, t := range tasks {
-		if str(t["status"]) == "done" {
-			done++
-		}
-	}
-	progress := 0
-	if total > 0 {
-		progress = done * 100 / total
-	}
+	// Progress is a separate metric from Stage: Stage comes straight from
+	// row["stage"], computed by the CrmProjectByID SQL query (task_stage
+	// CASE) — never touched here. Progress is computed bottom-up from each
+	// task's status (and, for parent tasks, their active children) via
+	// computeTaskProgress — the same helper CrmProjects (list) and
+	// TasksByCrmProject use, so list/detail/task-tab progress can never
+	// disagree. applyTaskProgress overrides each task row's progress_pct in
+	// place with its effective value and tags has_active_subtasks.
+	progressByTask := applyTaskProgress(tasks)
+	projectProgress := projectProgressFromTasks(tasks, progressByTask)
 
 	result := model.Row{}
 	for k, v := range row {
@@ -418,12 +439,36 @@ func (s *pmService) CrmProjectDetail(id int64) (model.Row, error) {
 	result["tasks"] = tasks
 	result["team"] = team
 	result["activity"] = activity
-	result["progress"] = progress
+	result["progress"] = projectProgress
 	return result, nil
 }
 
 func (s *pmService) TasksByCrmProject(id int64) ([]model.Row, error) {
-	return s.Repository.ProjectTasksByCrmProject(id)
+	tasks, err := s.Repository.ProjectTasksByCrmProject(id)
+	if err != nil {
+		return nil, err
+	}
+	applyTaskProgress(tasks)
+	return tasks, nil
+}
+
+// attachEffectiveProgress recomputes progress for a single task by pulling
+// every active task in its project (one query) and running the same
+// computeTaskProgress used by CrmProjectDetail/CrmProjects/TasksByCrmProject
+// — guarantees a create/update/move response always matches what the very
+// next list/detail fetch would show for that task, per the requirement that
+// a write must be reflected by the next response, not just eventually.
+func (s *pmService) attachEffectiveProgress(crmProjectID int64, row model.Row) (model.Row, error) {
+	tasks, err := s.Repository.ProjectTasksByCrmProject(crmProjectID)
+	if err != nil {
+		return row, nil // don't fail the whole write just because the progress refresh couldn't run
+	}
+	progress := applyTaskProgress(tasks)
+	if p, ok := progress[str(row["id"])]; ok {
+		row["progress_pct"] = p.Progress
+		row["has_active_subtasks"] = p.IsParent
+	}
+	return row, nil
 }
 
 func (s *pmService) CrmProjectMembers(crmProjectID int64) ([]model.Row, error) {
@@ -495,6 +540,17 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 		return nil, err
 	}
 
+	// A brand-new task always starts as a leaf (it can't have children yet),
+	// so its initial progress follows the same leaf status rule table used
+	// everywhere else — a manual progressPct in the body still wins, but
+	// to_do/done/in_review/in_progress floors and ceilings still apply.
+	var initialManualProgress *int64
+	if _, ok := body["progressPct"]; ok {
+		v := clampPercent(int64FromAny(body["progressPct"], 0))
+		initialManualProgress = &v
+	}
+	initialProgress := leafProgressForStatus(statusKey, 0, initialManualProgress)
+
 	id := uuid.NewString()
 	fields := map[string]interface{}{
 		"id":                 id,
@@ -507,7 +563,7 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 		"actual_finish_date": parseDateTime(strPtrFromAny(body["actualFinishDate"])),
 		"collaborators":      strPtrFromAny(body["collaborators"]),
 		"priority_id":        int64FromAny(body["priorityId"], 0),
-		"progress_pct":       clampPercent(int64FromAny(body["progressPct"], 0)),
+		"progress_pct":       initialProgress,
 		"status":             statusKey,
 		"status_id":          statusID,
 		"parent_task_id":     uuidPtrFromAny(body["parentTaskId"]),
@@ -526,7 +582,15 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 	}
 	s.logTaskActivity(id, crmProjectID, actorUserID, actorName, action, "", nil, strPtr(title), description)
 
-	return s.Repository.ProjectTaskByID(id)
+	created, err := s.Repository.ProjectTaskByID(id)
+	if err != nil {
+		return nil, err
+	}
+	// A new subtask changes its parent's (and the project's) effective
+	// progress — attachEffectiveProgress recomputes from the whole project's
+	// current task set, so this is reflected immediately, not just on the
+	// next unrelated fetch.
+	return s.attachEffectiveProgress(crmProjectID, created)
 }
 
 func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (model.Row, error) {
@@ -537,6 +601,12 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 	if err != nil {
 		return nil, err
 	}
+	childCount, err := s.Repository.ActiveChildTaskCount(id)
+	if err != nil {
+		return nil, err
+	}
+	isParent := childCount > 0
+
 	fields := map[string]interface{}{}
 	if title, ok := body["title"].(string); ok && strings.TrimSpace(title) != "" {
 		fields["title"] = title
@@ -562,15 +632,17 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 	if _, ok := body["priorityId"]; ok {
 		fields["priority_id"] = int64FromAny(body["priorityId"], 0)
 	}
-	if _, ok := body["progressPct"]; ok {
-		fields["progress_pct"] = clampPercent(int64FromAny(body["progressPct"], 0))
-	}
 	if _, ok := body["assignedTo"]; ok {
 		fields["assigned_to"] = int64PtrFromAny(body["assignedTo"])
 	}
 	if _, ok := body["parentTaskId"]; ok {
 		fields["parent_task_id"] = uuidPtrFromAny(body["parentTaskId"])
 	}
+
+	// Resolve the status this task will have AFTER this update (its new
+	// value if provided, else whatever it already had) — needed even when
+	// only progressPct changes, since the leaf progress rule depends on it.
+	newStatusKey := str(before["status"])
 	if statusRaw, ok := body["status"].(string); ok && strings.TrimSpace(statusRaw) != "" {
 		statusID, err := s.Repository.ResolveStatusID(nil, statusRaw)
 		if err != nil {
@@ -583,7 +655,29 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 		fields["status"] = statusKey
 		fields["status_id"] = statusID
 		fields["status_changed_at"] = time.Now().UTC()
+		newStatusKey = statusKey
 	}
+
+	// Progress: a parent task's progress is always derived from its children
+	// on read (see computeTaskProgress) — a manual progressPct aimed at one
+	// is silently dropped here rather than erroring, since the same request
+	// may legitimately be updating unrelated fields (title, assignee, ...).
+	// Leaf tasks route through leafProgressForStatus so a manual edit and/or
+	// a status change both still respect the to_do/in_review/done floors
+	// and ceilings, exactly like Kanban drag-move does.
+	if !isParent {
+		_, progressProvided := body["progressPct"]
+		_, statusChanged := fields["status"]
+		if progressProvided || statusChanged {
+			var manual *int64
+			if progressProvided {
+				v := clampPercent(int64FromAny(body["progressPct"], 0))
+				manual = &v
+			}
+			fields["progress_pct"] = leafProgressForStatus(newStatusKey, progressPctFromRow(before["progress_pct"]), manual)
+		}
+	}
+
 	if len(fields) > 0 {
 		if err := s.Repository.UpdateProjectTask(id, fields); err != nil {
 			return nil, err
@@ -595,7 +689,8 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 	}
 	actorUserID, actorName := s.resolveActor(actorSource(body, ""))
 	s.logTaskFieldChanges(id, before, after, actorUserID, actorName)
-	return after, nil
+
+	return s.attachEffectiveProgress(projectIDFromRow(after), after)
 }
 
 func (s *pmService) MoveProjectTaskByKey(id, statusKey string, actorUserIDRaw interface{}) (model.Row, error) {
@@ -609,13 +704,32 @@ func (s *pmService) MoveProjectTaskByKey(id, statusKey string, actorUserIDRaw in
 	if err := s.Repository.MoveProjectTaskByKey(id, statusKey); err != nil {
 		return nil, err
 	}
+
+	// Kanban drag never carries a manual progress value — apply the same
+	// leaf status rule table as everywhere else (to_do->0, in_progress->10
+	// only if it was 0, in_review->floor 90, done->100, blocked->unchanged).
+	// Parent tasks are skipped: their progress is always derived from
+	// children on read, dragging one on the board (if the UI even allows
+	// it) must not stomp a stored value nobody reads.
+	childCount, err := s.Repository.ActiveChildTaskCount(id)
+	if err != nil {
+		return nil, err
+	}
+	if childCount == 0 {
+		newProgress := leafProgressForStatus(statusKey, progressPctFromRow(before["progress_pct"]), nil)
+		if err := s.Repository.UpdateProjectTask(id, map[string]interface{}{"progress_pct": newProgress}); err != nil {
+			return nil, err
+		}
+	}
+
 	after, err := s.Repository.ProjectTaskByID(id)
 	if err != nil {
 		return nil, err
 	}
 	actorUserID, actorName := s.resolveActor(actorUserIDRaw)
 	s.logTaskFieldChanges(id, before, after, actorUserID, actorName)
-	return after, nil
+
+	return s.attachEffectiveProgress(projectIDFromRow(after), after)
 }
 
 func (s *pmService) DeleteProjectTask(id string, actorUserIDRaw interface{}) error {
@@ -870,10 +984,200 @@ func toInt64(v interface{}) (int64, bool) {
 		return n, true
 	case int32:
 		return int64(n), true
+	case int16:
+		// Postgres smallint columns (e.g. pm_project_tasks.progress_pct)
+		// scan into map[string]interface{} as Go int16, not int64/int32 —
+		// confirmed via runtime type check, not assumption.
+		return int64(n), true
 	case int:
 		return int64(n), true
 	}
 	return 0, false
+}
+
+// ─── Task/project progress computation (single source of truth) ───────────
+//
+// Effective progress is never trusted purely from the stored progress_pct
+// column — it's recomputed on every read from status + child tasks, so a
+// row written before this feature shipped (or edited any other way) always
+// self-corrects instead of showing a stale number. See CrmProjectDetail,
+// CrmProjects, TasksByCrmProject, and the task write paths (CreateTask/
+// UpdateTask/MoveTaskByKey below) for where this plugs in.
+
+// taskProgress holds one task's derived effective progress plus whether it
+// has any active direct subtasks. A task with subtasks is a "parent": its
+// progress is always the average of its children, never a manual value.
+type taskProgress struct {
+	Progress int64
+	IsParent bool
+}
+
+// projectIDFromRow reads crm_project_id out of a DB-scanned model.Row —
+// same toInt64-first-then-int64FromAny fallback already used by
+// logTaskFieldChanges, since the driver can hand this back as a native
+// int64 (toInt64) or, less commonly, something int64FromAny (float64/
+// string) can parse instead.
+func projectIDFromRow(row model.Row) int64 {
+	if id, ok := toInt64(row["crm_project_id"]); ok && id != 0 {
+		return id
+	}
+	return int64FromAny(row["crm_project_id"], 0)
+}
+
+// progressPctFromRow reads progress_pct out of a DB-scanned model.Row.
+// Postgres smallint columns typically arrive as int64 via database/sql, but
+// this tolerates int32/float64/string too rather than assuming one driver
+// behavior.
+func progressPctFromRow(v interface{}) int64 {
+	if n, ok := toInt64(v); ok {
+		return clampPercent(n)
+	}
+	switch n := v.(type) {
+	case float64:
+		return clampPercent(int64(n))
+	case string:
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+			return clampPercent(i)
+		}
+	}
+	return 0
+}
+
+// leafProgressForStatus is the single rule table for how a LEAF task's
+// progress reacts to its status — shared by task create, task update, and
+// Kanban drag-move, so the three can never diverge from each other.
+// manualProgress is a value the caller explicitly wants to set on this call
+// (nil if none, e.g. a plain drag-move never carries one); prevProgress is
+// the task's progress before this change.
+//
+//	to_do       -> always 0
+//	done        -> always 100 ('completed' is treated as a synonym)
+//	blocked     -> never auto-advances; only a genuine manual edit changes it
+//	in_review   -> floors at 90 (never lowers an already-higher value)
+//	in_progress -> 10 if it was 0, otherwise left alone
+//	anything else -> manual value if given, else unchanged
+func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress *int64) int64 {
+	base := prevProgress
+	if manualProgress != nil {
+		base = clampPercent(*manualProgress)
+	}
+	switch strings.ToLower(strings.TrimSpace(statusKey)) {
+	case "to_do":
+		return 0
+	case "done", "completed":
+		return 100
+	case "blocked":
+		return base
+	case "in_review":
+		if base < 90 {
+			return 90
+		}
+		return base
+	case "in_progress":
+		if base == 0 {
+			return 10
+		}
+		return base
+	default:
+		return base
+	}
+}
+
+// computeTaskProgress derives every task's EFFECTIVE progress bottom-up:
+// leaves come from leafProgressForStatus; a task with active children is the
+// rounded average of its children's own effective progress, computed
+// recursively so nested subtasks fold correctly however deep the tree goes.
+// `tasks` should be every active task sharing a scope (one project, or all
+// projects at once for the list endpoint) — this is one pass over an
+// already-fetched slice, never an extra query per task. A malformed/cyclic
+// parent_task_id chain (never seen in practice) falls back to that task's
+// stored value instead of recursing forever.
+func computeTaskProgress(tasks []model.Row) map[string]taskProgress {
+	childrenOf := make(map[string][]string, len(tasks))
+	byID := make(map[string]model.Row, len(tasks))
+	for _, t := range tasks {
+		id := str(t["id"])
+		byID[id] = t
+		if pid := str(t["parent_task_id"]); pid != "" {
+			childrenOf[pid] = append(childrenOf[pid], id)
+		}
+	}
+
+	result := make(map[string]taskProgress, len(tasks))
+	visiting := make(map[string]bool, len(tasks))
+
+	var resolve func(id string) int64
+	resolve = func(id string) int64 {
+		if r, ok := result[id]; ok {
+			return r.Progress
+		}
+		t, known := byID[id]
+		if !known {
+			return 0
+		}
+		if visiting[id] {
+			return progressPctFromRow(t["progress_pct"])
+		}
+		visiting[id] = true
+		kids := childrenOf[id]
+		if len(kids) == 0 {
+			p := leafProgressForStatus(str(t["status"]), progressPctFromRow(t["progress_pct"]), nil)
+			result[id] = taskProgress{Progress: p, IsParent: false}
+			visiting[id] = false
+			return p
+		}
+		var sum int64
+		for _, kid := range kids {
+			sum += resolve(kid)
+		}
+		avg := (sum + int64(len(kids))/2) / int64(len(kids)) // round-half-up
+		result[id] = taskProgress{Progress: avg, IsParent: true}
+		visiting[id] = false
+		return avg
+	}
+
+	for id := range byID {
+		resolve(id)
+	}
+	return result
+}
+
+// applyTaskProgress overrides tasks' progress_pct in place with their
+// computed effective value and tags each with has_active_subtasks (so the
+// frontend can disable manual editing for parent tasks), then returns the
+// progress map — also used by callers to derive the owning project's
+// overall progress via projectProgressFromTasks.
+func applyTaskProgress(tasks []model.Row) map[string]taskProgress {
+	progress := computeTaskProgress(tasks)
+	for _, t := range tasks {
+		id := str(t["id"])
+		p := progress[id]
+		t["progress_pct"] = p.Progress
+		t["has_active_subtasks"] = p.IsParent
+	}
+	return progress
+}
+
+// projectProgressFromTasks is the project-level progress rule: average
+// effective progress of ROOT tasks (parent_task_id empty) only — subtasks
+// are already folded into their parent's own effective value by
+// computeTaskProgress, so averaging every task directly would double-count
+// them. When no task has a parent at all, every task IS a root, so this
+// reduces exactly to "average of all active tasks" — the documented
+// no-hierarchy fallback. Zero active tasks -> 0.
+func projectProgressFromTasks(tasks []model.Row, progress map[string]taskProgress) int64 {
+	var sum, count int64
+	for _, t := range tasks {
+		if str(t["parent_task_id"]) != "" {
+			continue
+		}
+		sum += progress[str(t["id"])].Progress
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	return (sum + count/2) / count
 }
 
 func parseDateTime(v *string) *time.Time {
@@ -1075,10 +1379,7 @@ func dateOrUnset(v string) string {
 // tracked field — matches the granular examples in the spec ("changed status
 // from To Do to In progress") rather than one noisy combined entry.
 func (s *pmService) logTaskFieldChanges(taskID string, before, after model.Row, actorUserID *int64, actorName string) {
-	projectID, _ := toInt64(before["crm_project_id"])
-	if projectID == 0 {
-		projectID = int64FromAny(before["crm_project_id"], 0)
-	}
+	projectID := projectIDFromRow(before)
 	for _, field := range taskActivityFields {
 		oldVal := field.value(before)
 		newVal := field.value(after)

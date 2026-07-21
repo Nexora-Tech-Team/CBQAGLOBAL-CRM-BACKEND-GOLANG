@@ -60,6 +60,8 @@ type RepositoryInterface interface {
 	MoveProjectTaskByKey(id, statusKey string) error
 	DeleteProjectTask(id string) error
 	GanttMembers() ([]model.Row, error)
+	ActiveTaskProgressInputs() ([]model.Row, error)
+	ActiveChildTaskCount(parentTaskID string) (int64, error)
 
 	// Task activity log (pm_task_activity_logs) — audit trail for the Task
 	// Detail drawer's "Activity" section.
@@ -499,10 +501,9 @@ func (r *repository) LogActivity(action, logType, title string, typeID int64, lo
 // lookups) for both the list and detail queries that embed it.
 //
 // LOWER(status) IN (...) tolerates status-key variants beyond the current
-// pm_task_statuses seed (to_do/in_progress/in_review/done) — e.g. 'completed'
-// as a synonym for 'done', or differently-cased values — without requiring a
-// migration if the Kanban's status vocabulary changes later. Verified against
-// live data (2026-07-21): only to_do/in_progress/in_review/done exist today.
+// pm_task_statuses seed (to_do/in_progress/in_review/blocked/done) — e.g.
+// 'completed' as a synonym for 'done', or differently-cased values — without
+// requiring a migration if the Kanban's status vocabulary changes later.
 const taskStageJoinSQL = `
 		LEFT JOIN (
 		  SELECT
@@ -744,6 +745,37 @@ func (r *repository) MoveProjectTaskByKey(id, statusKey string) error {
 
 func (r *repository) DeleteProjectTask(id string) error {
 	return r.DB.Exec(`UPDATE pm_project_tasks SET deleted = TRUE, updated_at = NOW() WHERE id = ?`, id).Error
+}
+
+// ActiveTaskProgressInputs returns the minimal fields needed to compute
+// effective task/parent/project progress (see computeTaskProgress in
+// service.go) across ALL CRM-linked projects in one query — used by the
+// CrmProjects list so per-project progress never costs an extra query per
+// project row. Unscoped by project on purpose: this table is small (PM task
+// counts run in the tens-to-hundreds, not pagination-scale), so one flat
+// fetch + in-memory grouping is simpler and safer than assembling a dynamic
+// project-id IN(...)/ANY(...) list.
+func (r *repository) ActiveTaskProgressInputs() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT id::text AS id, crm_project_id, parent_task_id::text AS parent_task_id,
+		       status, progress_pct
+		FROM pm_project_tasks
+		WHERE deleted = FALSE
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// ActiveChildTaskCount reports how many active (non-deleted) direct children
+// a task has. A count > 0 makes the task a "parent" whose progress is always
+// derived from those children — used to reject/ignore a manual progress
+// edit aimed at a parent task (see UpdateProjectTask).
+func (r *repository) ActiveChildTaskCount(parentTaskID string) (int64, error) {
+	var count int64
+	err := r.DB.Raw(`
+		SELECT COUNT(*) FROM pm_project_tasks WHERE parent_task_id = ? AND deleted = FALSE
+	`, parentTaskID).Scan(&count).Error
+	return count, err
 }
 
 // InsertTaskActivityLog appends one audit-trail row. Never deleted alongside
