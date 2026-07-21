@@ -1,11 +1,11 @@
 #!/bin/bash
 # Deploys a new erp-cbqa-global binary to the STAGING box (212.85.25.165,
-# api-pm-dev.nexoratech.co): backup current binary, apply any new migration
-# SQL (idempotent, IF NOT EXISTS-guarded), swap the binary, restart the
-# systemd service, health-check it, auto-rollback on failure.
+# api-pm-dev.nexoratech.co): backup current binary, swap the binary,
+# restart the systemd service, health-check it, auto-rollback on failure.
+# Migrations are applied manually direct to the DB, not by this script.
 #
 # Usage: deploy-golang-staging.sh <path-to-extracted-artifact-dir>
-#   (that dir must contain ./erp-cbqa-global and optionally ./migrate/*.sql)
+#   (that dir must contain ./erp-cbqa-global)
 #
 # Runs on the server itself, invoked over SSH by
 # .github/workflows/deploy-staging.yml (push-based — this box only has
@@ -20,7 +20,6 @@ BIN_PATH="$APP_DIR/erp-cbqa-global"
 BACKUP_DIR="$APP_DIR/backups"
 SERVICE_NAME="cbqaglobal-golang-pm-staging"
 HEALTH_URL="http://localhost:4000/api/v1/pm/task-statuses"
-DB_ENV_FILE="$APP_DIR/.env"  # must contain POSTGRESQL_URL for psql below
 
 mkdir -p "$APP_DIR" "$BACKUP_DIR"
 TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
@@ -32,22 +31,15 @@ if [ -f "$BIN_PATH" ]; then
   ls -1t "$BACKUP_DIR"/erp-cbqa-global.* 2>/dev/null | tail -n +11 | xargs -r rm -f
 fi
 
-# 2. Apply migrations (additive-only, IF NOT EXISTS — safe to re-run).
-if [ -d "$SRC_DIR/migrate" ] && [ -f "$DB_ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  source "$DB_ENV_FILE"
-  if [ -n "${POSTGRESQL_URL:-}" ]; then
-    for f in "$SRC_DIR"/migrate/*.sql; do
-      [ -f "$f" ] || continue
-      echo "Applying migration: $(basename "$f")"
-      psql "$POSTGRESQL_URL" -f "$f" || echo "WARNING: migration $(basename "$f") returned non-zero (likely already applied)"
-    done
-  fi
-fi
+# 2. Migrations are applied manually direct to the DB, not from here.
 
-# 3. Swap binary and restart.
-cp "$SRC_DIR/erp-cbqa-global" "$BIN_PATH"
-chmod +x "$BIN_PATH"
+# 3. Swap binary and restart. Copy to a temp file then rename into place —
+# an in-place overwrite (cp truncating the target) fails with "Text file
+# busy" while the old binary is still running.
+TMP_BIN="$BIN_PATH.new"
+cp "$SRC_DIR/erp-cbqa-global" "$TMP_BIN"
+chmod +x "$TMP_BIN"
+mv "$TMP_BIN" "$BIN_PATH"
 systemctl restart "$SERVICE_NAME"
 
 # 4. Health-check with retries.
@@ -63,8 +55,9 @@ done
 echo "Health check FAILED after retries — rolling back."
 LATEST_BACKUP="$(ls -1t "$BACKUP_DIR"/erp-cbqa-global.* 2>/dev/null | head -1 || true)"
 if [ -n "$LATEST_BACKUP" ]; then
-  cp "$LATEST_BACKUP" "$BIN_PATH"
-  chmod +x "$BIN_PATH"
+  cp "$LATEST_BACKUP" "$TMP_BIN"
+  chmod +x "$TMP_BIN"
+  mv "$TMP_BIN" "$BIN_PATH"
   systemctl restart "$SERVICE_NAME"
   sleep 3
   if curl -sf -o /dev/null "$HEALTH_URL"; then
