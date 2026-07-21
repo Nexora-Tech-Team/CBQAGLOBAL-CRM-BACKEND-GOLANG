@@ -36,6 +36,7 @@ type ServiceInterface interface {
 
 	CrmProjects(search string) ([]model.Row, error)
 	CrmProjectDetail(id int64) (model.Row, error)
+	UpdateCrmProjectOverview(id int64, body map[string]interface{}) (model.Row, error)
 	TasksByCrmProject(id int64) ([]model.Row, error)
 	CreateTaskForCrmProject(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error)
 	UpdateProjectTask(id string, body map[string]interface{}) (model.Row, error)
@@ -339,6 +340,41 @@ func (s *pmService) ActivityLogs() ([]model.Row, error) {
 
 func (s *pmService) CrmProjects(search string) ([]model.Row, error) {
 	return s.Repository.CrmProjects(search)
+}
+
+// UpdateCrmProjectOverview saves the PM Overview tab's editable fields:
+// owner + project dates live on the CRM `projects` table, while picUserId
+// (the PM-side "PIC", distinct from owner) lives on `pm_projects`. Returns
+// the same shape as CrmProjectDetail so the frontend can swap in the fresh
+// data straight from the PUT response.
+func (s *pmService) UpdateCrmProjectOverview(id int64, body map[string]interface{}) (model.Row, error) {
+	fields := map[string]interface{}{}
+	if _, ok := body["owner"]; ok {
+		fields["assigned_to"] = strPtrFromAny(body["owner"])
+	}
+	if _, ok := body["projectStartDate"]; ok {
+		if d := parseDateTime(strPtrFromAny(body["projectStartDate"])); d != nil {
+			fields["project_date"] = d
+		}
+	}
+	if _, ok := body["projectEndDate"]; ok {
+		if d := parseDateTime(strPtrFromAny(body["projectEndDate"])); d != nil {
+			fields["valid_until"] = d
+		}
+	}
+	if len(fields) > 0 {
+		if err := s.Repository.UpdateCrmProject(id, fields); err != nil {
+			return nil, err
+		}
+	}
+
+	if _, ok := body["picUserId"]; ok {
+		if err := s.Repository.UpsertPmProjectPic(id, int64PtrFromAny(body["picUserId"])); err != nil {
+			return nil, err
+		}
+	}
+
+	return s.CrmProjectDetail(id)
 }
 
 func (s *pmService) CrmProjectDetail(id int64) (model.Row, error) {

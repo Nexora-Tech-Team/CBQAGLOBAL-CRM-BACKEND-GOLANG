@@ -49,6 +49,8 @@ type RepositoryInterface interface {
 	// CRM-project-linked task board (real `projects` table, Advisory/Audit Program services).
 	CrmProjects(search string) ([]model.Row, error)
 	CrmProjectByID(id int64) (model.Row, error)
+	UpdateCrmProject(id int64, fields map[string]interface{}) error
+	UpsertPmProjectPic(crmProjectID int64, picUserID *int64) error
 	ProjectTasksByCrmProject(crmProjectID int64) ([]model.Row, error)
 	TeamByCrmProject(crmProjectID int64) ([]model.Row, error)
 	ActivityByCrmProject(crmProjectID int64) ([]model.Row, error)
@@ -531,17 +533,22 @@ func (r *repository) CrmProjectByID(id int64) (model.Row, error) {
 		  COALESCE(l.project_name, c.company_name) AS title,
 		  p.project_date AS start_date,
 		  p.valid_until AS end_date,
+		  p.project_date AS project_start_date,
+		  p.valid_until AS project_end_date,
 		  p.status,
 		  c.company_name AS client_name,
 		  l.company_id,
 		  l.project_description AS scope,
 		  p.assigned_to AS owner_name,
-		  NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), '') AS owner,
+		  p.assigned_to AS owner,
+		  pm.pic_user_id,
+		  NULLIF(TRIM(COALESCE(pu.first_name, '') || ' ' || COALESCE(pu.last_name, '')), '') AS pic,
 		  p.updated_at
 		FROM projects p
 		JOIN leads l ON l.id = p.lead_id
 		JOIN companies c ON c.id = l.company_id
-		LEFT JOIN users cu ON cu.id = p.cuser_id
+		LEFT JOIN pm_projects pm ON pm.crm_project_id = p.id AND pm.deleted = FALSE
+		LEFT JOIN users pu ON pu.id = pm.pic_user_id
 		WHERE p.id = ?
 		LIMIT 1
 	`, id).Scan(&rows).Error
@@ -552,6 +559,52 @@ func (r *repository) CrmProjectByID(id int64) (model.Row, error) {
 		return nil, fmt.Errorf("project not found: %d", id)
 	}
 	return rows[0], nil
+}
+
+// UpdateCrmProject updates columns on the real CRM `projects` table (owner,
+// project dates, etc.) — used by the PM Overview tab's Save action. Fields
+// map keys must already be the target `projects` column names.
+func (r *repository) UpdateCrmProject(id int64, fields map[string]interface{}) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	set, values := buildUpdate(fields)
+	values = append(values, id)
+	sql := fmt.Sprintf(`UPDATE projects SET %s WHERE id = ?`, set)
+	return r.DB.Exec(sql, values...).Error
+}
+
+// UpsertPmProjectPic sets the PM-side "PIC" (person in charge) for a
+// CRM-linked project. pm_projects has no row per CRM project by default
+// (it's the legacy Library module's table, keyed by its own `legacy_id`),
+// so this creates a minimal shadow row on first use — same pattern as the
+// Java backend's ensurePmProject — then just updates pic_user_id on it.
+func (r *repository) UpsertPmProjectPic(crmProjectID int64, picUserID *int64) error {
+	res := r.DB.Exec(`
+		UPDATE pm_projects SET pic_user_id = ?, updated_at = NOW()
+		WHERE crm_project_id = ? AND deleted = FALSE
+	`, picUserID, crmProjectID)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+
+	var title string
+	if err := r.DB.Raw(`SELECT COALESCE(l.project_name, c.company_name) FROM projects p
+		JOIN leads l ON l.id = p.lead_id JOIN companies c ON c.id = l.company_id
+		WHERE p.id = ?`, crmProjectID).Scan(&title).Error; err != nil {
+		return err
+	}
+	if title == "" {
+		title = fmt.Sprintf("CRM Project #%d", crmProjectID)
+	}
+
+	return r.DB.Exec(`
+		INSERT INTO pm_projects (legacy_id, title, client_id, created_by, status_id, crm_project_id, pic_user_id)
+		VALUES ((SELECT COALESCE(MAX(legacy_id), 0) + 1 FROM pm_projects), ?, 0, 0, 0, ?, ?)
+	`, title, crmProjectID, picUserID).Error
 }
 
 // ProjectTasksByCrmProject powers both the Tasks tab list "Assignee" column

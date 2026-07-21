@@ -289,6 +289,24 @@ func (pc *pmController) CrmProjectDetail(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, data)
 }
 
+func (pc *pmController) UpdateCrmProjectOverview(ctx *gin.Context) {
+	id, ok := parseIDParam(ctx, "id")
+	if !ok {
+		return
+	}
+	var body map[string]interface{}
+	if err := ctx.ShouldBindJSON(&body); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, err := pc.Service.UpdateCrmProjectOverview(id, body)
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
 func (pc *pmController) CrmProjectTasks(ctx *gin.Context) {
 	id, ok := parseIDParam(ctx, "id")
 	if !ok {
