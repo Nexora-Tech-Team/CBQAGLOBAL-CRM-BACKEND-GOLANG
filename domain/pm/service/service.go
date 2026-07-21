@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -44,6 +45,12 @@ type ServiceInterface interface {
 	DeleteProjectTask(id string, actorUserIDRaw interface{}) error
 	TaskActivityLogs(taskID string) ([]model.Row, error)
 	GanttMembers() ([]model.Row, error)
+
+	// Work Timer (clock in/out) — pm_task_time_logs.
+	ClockInTask(taskID string, userID int64, actorUserIDRaw interface{}) (model.Row, error)
+	ClockOutTask(taskID string, userID int64, note *string, actorUserIDRaw interface{}) (model.Row, error)
+	TaskTimeLogs(taskID string, userID int64) (model.Row, error)
+	ActiveTimeLogForUser(userID int64) (model.Row, error)
 
 	CrmProjectMembers(crmProjectID int64) ([]model.Row, error)
 	AddCrmProjectMember(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error)
@@ -759,6 +766,169 @@ func (s *pmService) TaskActivityLogs(taskID string) ([]model.Row, error) {
 
 func (s *pmService) GanttMembers() ([]model.Row, error) {
 	return s.Repository.GanttMembers()
+}
+
+// ─── Work Timer (clock in/out) ─────────────────────────────────────────────
+
+// formatDurationShort renders seconds as a compact "1h 25m" label for
+// activity-log descriptions — mirrors the frontend's own duration formatter
+// so the log reads the same way the Work Logs panel displays it.
+func formatDurationShort(totalSeconds int64) string {
+	if totalSeconds < 60 {
+		return fmt.Sprintf("%ds", totalSeconds)
+	}
+	hours := totalSeconds / 3600
+	minutes := (totalSeconds % 3600) / 60
+	if hours == 0 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	return fmt.Sprintf("%dh %dm", hours, minutes)
+}
+
+func (s *pmService) ClockInTask(taskID string, userID int64, actorUserIDRaw interface{}) (model.Row, error) {
+	if !validUUID(taskID) {
+		return nil, fmt.Errorf("invalid task id")
+	}
+	if userID == 0 {
+		return nil, fmt.Errorf("userId is required")
+	}
+	task, err := s.Repository.ProjectTaskByID(taskID)
+	if err != nil {
+		return nil, err
+	}
+	projectID := projectIDFromRow(task)
+
+	row, err := s.Repository.ClockIn(taskID, userID, &projectID)
+	if err != nil {
+		if errors.Is(err, repository.ErrAlreadyClockedIn) {
+			return nil, s.describeAlreadyClockedIn(userID, err)
+		}
+		return nil, err
+	}
+
+	actorUserID, actorName := s.resolveActor(actorSource(map[string]interface{}{"actorUserId": actorUserIDRaw}, ""))
+	if actorUserID == nil {
+		actorUserID = &userID
+	}
+	if actorName == "" || actorName == "System" {
+		if name, nameErr := s.Repository.ResolveUserName(userID); nameErr == nil && name != "" {
+			actorName = name
+		}
+	}
+	s.logTaskActivity(taskID, projectID, actorUserID, actorName, "clock_in", "", nil, nil,
+		fmt.Sprintf("%s clocked in", actorName))
+
+	return row, nil
+}
+
+func (s *pmService) ClockOutTask(taskID string, userID int64, note *string, actorUserIDRaw interface{}) (model.Row, error) {
+	if !validUUID(taskID) {
+		return nil, fmt.Errorf("invalid task id")
+	}
+	if userID == 0 {
+		return nil, fmt.Errorf("userId is required")
+	}
+	row, err := s.Repository.ClockOut(taskID, userID, note)
+	if err != nil {
+		if errors.Is(err, repository.ErrNoActiveTimeLog) {
+			return nil, err
+		}
+		return nil, err
+	}
+
+	projectID := projectIDFromRow(row)
+	actorUserID, actorName := s.resolveActor(actorSource(map[string]interface{}{"actorUserId": actorUserIDRaw}, ""))
+	if actorUserID == nil {
+		actorUserID = &userID
+	}
+	if actorName == "" || actorName == "System" {
+		if name, nameErr := s.Repository.ResolveUserName(userID); nameErr == nil && name != "" {
+			actorName = name
+		}
+	}
+	duration, _ := toInt64(row["duration_seconds"])
+	s.logTaskActivity(taskID, projectID, actorUserID, actorName, "clock_out", "", nil, nil,
+		fmt.Sprintf("%s clocked out (%s)", actorName, formatDurationShort(duration)))
+
+	return row, nil
+}
+
+// TaskTimeLogs bundles the full session history for a task with the two
+// running totals the Work Logs panel needs (all-users total, this-user's
+// own total — both over CLOSED sessions only, since an open session's
+// duration isn't final yet) and, separately, the requesting user's own
+// still-open session on this task (if any), so the frontend can render the
+// running timer + Clock Out button without a second request.
+func (s *pmService) TaskTimeLogs(taskID string, userID int64) (model.Row, error) {
+	if !validUUID(taskID) {
+		return nil, fmt.Errorf("invalid task id")
+	}
+	logs, err := s.Repository.TimeLogsByTask(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	var totalDuration, myDuration int64
+	var activeLog model.Row
+	for _, log := range logs {
+		logUserID, _ := toInt64(log["user_id"])
+		if log["ended_at"] == nil {
+			if userID != 0 && logUserID == userID {
+				activeLog = log
+			}
+			continue
+		}
+		duration, _ := toInt64(log["duration_seconds"])
+		totalDuration += duration
+		if userID != 0 && logUserID == userID {
+			myDuration += duration
+		}
+	}
+
+	return model.Row{
+		"logs":                 logs,
+		"totalDurationSeconds": totalDuration,
+		"myDurationSeconds":    myDuration,
+		"activeLog":            activeLog,
+	}, nil
+}
+
+// ActiveTimeLogForUser answers "is this user clocked in anywhere right now",
+// enriched with the task's title/project so the frontend can render a
+// friendly "Clocked in on another task: <title>" message without a second
+// lookup.
+func (s *pmService) ActiveTimeLogForUser(userID int64) (model.Row, error) {
+	if userID == 0 {
+		return nil, fmt.Errorf("userId is required")
+	}
+	active, err := s.Repository.ActiveTimeLogForUser(userID)
+	if err != nil {
+		return nil, err
+	}
+	if active == nil {
+		return model.Row{"activeLog": nil}, nil
+	}
+	if task, taskErr := s.Repository.ProjectTaskByID(str(active["task_id"])); taskErr == nil {
+		active["task_title"] = task["title"]
+		active["crm_project_id"] = task["crm_project_id"]
+	}
+	return model.Row{"activeLog": active}, nil
+}
+
+// describeAlreadyClockedIn turns the bare ErrAlreadyClockedIn into a message
+// naming the task the user is already on, when that can be resolved —
+// falls back to the generic error if the lookup itself fails for any reason
+// (never let a best-effort enrichment mask the real 409).
+func (s *pmService) describeAlreadyClockedIn(userID int64, fallback error) error {
+	active, err := s.Repository.ActiveTimeLogForUser(userID)
+	if err != nil || active == nil {
+		return fallback
+	}
+	task, err := s.Repository.ProjectTaskByID(str(active["task_id"]))
+	if err != nil || task["title"] == nil {
+		return fallback
+	}
+	return fmt.Errorf("already clocked in on \"%s\" — clock out there first: %w", str(task["title"]), fallback)
 }
 
 func periodRange(period string) (*string, *string) {

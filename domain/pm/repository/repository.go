@@ -10,6 +10,14 @@ import (
 	"erp-cbqa-global/domain/pm/model"
 )
 
+// ErrAlreadyClockedIn: the user already has an open (ended_at IS NULL) time
+// log on some task — must clock out there before clocking in elsewhere.
+var ErrAlreadyClockedIn = errors.New("user already has an active clock-in on another task")
+
+// ErrNoActiveTimeLog: clock-out was requested but this user has no open
+// time log on this task to close.
+var ErrNoActiveTimeLog = errors.New("no active clock-in for this user on this task")
+
 type RepositoryInterface interface {
 	DashboardTotals() (model.Row, error)
 	DashboardProjectsByStatus() ([]model.Row, error)
@@ -62,6 +70,12 @@ type RepositoryInterface interface {
 	GanttMembers() ([]model.Row, error)
 	ActiveTaskProgressInputs() ([]model.Row, error)
 	ActiveChildTaskCount(parentTaskID string) (int64, error)
+
+	// Work Timer (clock in/out) — pm_task_time_logs.
+	ClockIn(taskID string, userID int64, projectID *int64) (model.Row, error)
+	ClockOut(taskID string, userID int64, note *string) (model.Row, error)
+	TimeLogsByTask(taskID string) ([]model.Row, error)
+	ActiveTimeLogForUser(userID int64) (model.Row, error)
 
 	// Task activity log (pm_task_activity_logs) — audit trail for the Task
 	// Detail drawer's "Activity" section.
@@ -776,6 +790,133 @@ func (r *repository) ActiveChildTaskCount(parentTaskID string) (int64, error) {
 		SELECT COUNT(*) FROM pm_project_tasks WHERE parent_task_id = ? AND deleted = FALSE
 	`, parentTaskID).Scan(&count).Error
 	return count, err
+}
+
+// timeLogSelectSQL is shared by every read path that returns a
+// pm_task_time_logs row (clock-in/out responses, TimeLogsByTask,
+// ActiveTimeLogForUser) so the shape can never drift between them.
+// task_id::text avoids the same uuid-column-scans-as-[]byte JSON encoding
+// bug documented on ProjectTasksByCrmProject above.
+const timeLogSelectSQL = `
+	SELECT tl.id, tl.task_id::text AS task_id, tl.project_id, tl.user_id,
+	       tl.started_at, tl.ended_at, tl.duration_seconds, tl.note,
+	       tl.created_at, tl.updated_at,
+	       NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS user_name
+	FROM pm_task_time_logs tl
+	LEFT JOIN users u ON u.id = tl.user_id
+`
+
+// ClockIn opens a new time-log session for userID on taskID. Transactional:
+// re-checks for an existing open session under the transaction before
+// inserting, and the UNIQUE partial index (migration 013) is the hard
+// backstop against a concurrent double clock-in slipping through the gap
+// between that check and the insert.
+func (r *repository) ClockIn(taskID string, userID int64, projectID *int64) (model.Row, error) {
+	var result model.Row
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var openCount int64
+		if err := tx.Raw(`
+			SELECT COUNT(*) FROM pm_task_time_logs
+			WHERE user_id = ? AND ended_at IS NULL AND deleted_at IS NULL
+		`, userID).Scan(&openCount).Error; err != nil {
+			return err
+		}
+		if openCount > 0 {
+			return ErrAlreadyClockedIn
+		}
+
+		var id int64
+		if err := tx.Raw(`
+			INSERT INTO pm_task_time_logs (task_id, project_id, user_id, started_at, created_at, updated_at)
+			VALUES (?, ?, ?, NOW(), NOW(), NOW())
+			RETURNING id
+		`, taskID, projectID, userID).Scan(&id).Error; err != nil {
+			return err
+		}
+
+		var rows []model.Row
+		if err := tx.Raw(timeLogSelectSQL+` WHERE tl.id = ?`, id).Scan(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return errors.New("time log not found after insert")
+		}
+		result = rows[0]
+		return nil
+	})
+	return result, err
+}
+
+// ClockOut closes userID's open session on taskID: sets ended_at to now,
+// computes duration_seconds from started_at, and stores note if given.
+func (r *repository) ClockOut(taskID string, userID int64, note *string) (model.Row, error) {
+	var result model.Row
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var rows []model.Row
+		if err := tx.Raw(`
+			SELECT id FROM pm_task_time_logs
+			WHERE task_id = ? AND user_id = ? AND ended_at IS NULL AND deleted_at IS NULL
+			ORDER BY id DESC LIMIT 1
+		`, taskID, userID).Scan(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return ErrNoActiveTimeLog
+		}
+		id, _ := toInt64(rows[0]["id"])
+
+		if err := tx.Exec(`
+			UPDATE pm_task_time_logs
+			SET ended_at = NOW(),
+			    duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (NOW() - started_at))::bigint),
+			    note = COALESCE(?, note),
+			    updated_at = NOW()
+			WHERE id = ?
+		`, note, id).Error; err != nil {
+			return err
+		}
+
+		var closed []model.Row
+		if err := tx.Raw(timeLogSelectSQL+` WHERE tl.id = ?`, id).Scan(&closed).Error; err != nil {
+			return err
+		}
+		if len(closed) == 0 {
+			return errors.New("time log not found after close")
+		}
+		result = closed[0]
+		return nil
+	})
+	return result, err
+}
+
+// TimeLogsByTask returns every session (open or closed) logged against a
+// task, newest first — the Work Logs panel's data source.
+func (r *repository) TimeLogsByTask(taskID string) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(timeLogSelectSQL+`
+		WHERE tl.task_id = ? AND tl.deleted_at IS NULL
+		ORDER BY tl.started_at DESC, tl.id DESC
+	`, taskID).Scan(&rows).Error
+	return rows, err
+}
+
+// ActiveTimeLogForUser returns userID's single open session, if any —
+// across ALL tasks, not scoped to one. Used both to answer
+// GET /time-logs/active and, from the service layer, to build the
+// "clocked in on another task" message when a clock-in is rejected.
+func (r *repository) ActiveTimeLogForUser(userID int64) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(timeLogSelectSQL+`
+		WHERE tl.user_id = ? AND tl.ended_at IS NULL AND tl.deleted_at IS NULL
+		ORDER BY tl.id DESC LIMIT 1
+	`, userID).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return rows[0], nil
 }
 
 // InsertTaskActivityLog appends one audit-trail row. Never deleted alongside

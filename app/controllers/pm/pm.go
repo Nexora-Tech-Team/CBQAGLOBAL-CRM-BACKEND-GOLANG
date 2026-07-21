@@ -1,6 +1,7 @@
 package pm
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -431,6 +432,122 @@ func (pc *pmController) GanttMembers(ctx *gin.Context) {
 		return
 	}
 	ctx.JSON(http.StatusOK, data)
+}
+
+// ClockInTask handles POST /tasks/:id/clock-in — body: { userId, actorUserId? }.
+func (pc *pmController) ClockInTask(ctx *gin.Context) {
+	taskID := ctx.Param("id")
+	var body map[string]interface{}
+	if err := ctx.ShouldBindJSON(&body); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID := int64FromBody(body["userId"])
+	if userID == 0 {
+		response.Error(ctx, http.StatusBadRequest, "userId is required")
+		return
+	}
+	data, err := pc.Service.ClockInTask(taskID, userID, body["actorUserId"])
+	if err != nil {
+		if errors.Is(err, repository.ErrAlreadyClockedIn) {
+			response.Error(ctx, http.StatusConflict, err.Error())
+			return
+		}
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+// ClockOutTask handles POST /tasks/:id/clock-out — body: { userId, note?, actorUserId? }.
+func (pc *pmController) ClockOutTask(ctx *gin.Context) {
+	taskID := ctx.Param("id")
+	var body map[string]interface{}
+	if err := ctx.ShouldBindJSON(&body); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID := int64FromBody(body["userId"])
+	if userID == 0 {
+		response.Error(ctx, http.StatusBadRequest, "userId is required")
+		return
+	}
+	var note *string
+	if n, ok := body["note"].(string); ok && n != "" {
+		note = &n
+	}
+	data, err := pc.Service.ClockOutTask(taskID, userID, note, body["actorUserId"])
+	if err != nil {
+		if errors.Is(err, repository.ErrNoActiveTimeLog) {
+			response.Error(ctx, http.StatusBadRequest, err.Error())
+			return
+		}
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+// TaskTimeLogs handles GET /tasks/:id/time-logs.
+func (pc *pmController) TaskTimeLogs(ctx *gin.Context) {
+	taskID := ctx.Param("id")
+	var userID int64
+	if raw := ctx.Query("userId"); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			userID = parsed
+		}
+	}
+	data, err := pc.Service.TaskTimeLogs(taskID, userID)
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+// ActiveTimeLog handles GET /time-logs/active?userId=... — lets the
+// frontend check "is this user clocked in somewhere" before it even opens
+// a task (e.g. to show the lock state up front on a different task's drawer).
+func (pc *pmController) ActiveTimeLog(ctx *gin.Context) {
+	userID, ok := parseInt64QueryRequired(ctx, "userId")
+	if !ok {
+		return
+	}
+	data, err := pc.Service.ActiveTimeLogForUser(userID)
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+func parseInt64QueryRequired(ctx *gin.Context, name string) (int64, bool) {
+	raw := ctx.Query(name)
+	if raw == "" {
+		response.Error(ctx, http.StatusBadRequest, name+" is required")
+		return 0, false
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		response.Error(ctx, http.StatusBadRequest, "invalid "+name)
+		return 0, false
+	}
+	return id, true
+}
+
+// int64FromBody mirrors the service layer's int64FromAny for a JSON request
+// body value (numbers decode as float64) — kept local to the controller so
+// it doesn't need to reach into the service package's unexported helpers.
+func int64FromBody(v interface{}) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case string:
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+			return i
+		}
+	}
+	return 0
 }
 
 func (pc *pmController) Tickets(ctx *gin.Context) {
