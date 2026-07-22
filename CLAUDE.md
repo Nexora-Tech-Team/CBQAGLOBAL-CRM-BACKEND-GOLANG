@@ -242,6 +242,84 @@ would need the same bottom-up recursion `computeTaskProgress` does in Go,
 which is a bigger change than this task's scope (renaming the Stage label,
 not re-deriving its inputs). Flagging for whoever touches Stage next.
 
+## PM Dashboard summary endpoint — `GET /v1/pm/dashboard/summary` (2026-07-22)
+
+New high-level portfolio monitoring endpoint powering `/pm/dashboard` on the
+frontend (project health, portfolio progress, team workload, active work
+sessions, upcoming deadlines, recent activity). Route registered in
+`config/collection/routes.go`; handler `pmCtrl.DashboardSummary` →
+`service.DashboardSummary()` → 6 new repository methods, all documented
+inline in `repository.go`/`service.go`:
+
+- `PmPortfolioProjects()` — one row per CRM-linked PM project (same
+  Advisory/Audit Program scope as `CrmProjects`), reusing `taskStageCaseSQL`/
+  `taskStageJoinSQL` verbatim for Stage (never re-derived differently), plus
+  a new `planWindowJoinSQL` const (`MIN(start_date)`/`MAX(deadline)` per
+  project) for the planned-progress side of Portfolio Progress.
+- `PmPortfolioTasks()` — every non-deleted PM task, unscoped (same "small
+  table, fetch once" rationale as the existing `ActiveTaskProgressInputs`),
+  widened with `title`/`deadline`/`assigned_to`/`assignee_name` for
+  workload/overdue/deadline derivation.
+- `PmMembersForWorkload()` — `GanttMembers`' exact WHERE clause (IT Audit
+  dept, active internal users) plus `job_title`, as its own method so
+  `GanttMembers` itself (the assignee picker) can't drift.
+- `PmActiveWorkSessions()` — every currently open (`ended_at IS NULL`) time
+  log across ALL users (not just one, unlike `ActiveTimeLogForUser`) — the
+  org-wide "who's clocked in right now" view, also used to fill each Team
+  Workload row's `currentClockIn`.
+- `PmWeeklySecondsByUser()` — per-user seconds tracked this calendar week
+  (`date_trunc('week', NOW())`, matching `TimesheetSummary`'s own
+  week-bucketing convention), including any still-open session's live
+  elapsed time.
+- `PmRecentActivity(limit)` — `TaskActivityLogs` widened from "one task" to
+  "every task, most recent first". There is currently no project-level
+  "project updated" / "member added" log entry anywhere in this codebase
+  (`UpdateCrmProject`/`InsertCrmProjectMember` don't call
+  `logTaskActivity`), so those two categories from the frontend spec simply
+  won't appear in the feed yet — never fabricated to fill the gap.
+
+**New derivation rules, all in `service.go` (no prior metric existed for
+these — first-principles, documented inline):**
+
+- **Planned progress** (`planProgressPercent`): % of a project's
+  `plan_start`→`plan_end` window elapsed as of now, clamped 0-100. Falls
+  back to 0 (not excluded) when either bound is missing, so portfolio
+  averages always divide by every project.
+- **Actual progress**: reuses `computeTaskProgress`/`projectProgressFromTasks`
+  verbatim — same source of truth as `CrmProjects`/`CrmProjectDetail`.
+- **Health**: Blocked (any blocked task or Stage=Blocked) > At Risk (any
+  overdue task, or plan window's end already past and Stage≠Completed, or
+  actual < planned) > Healthy.
+- **Attention Needed issue** (single most severe per project): Blocked >
+  Overdue > Behind plan > No recent update (`updated_at` > 14 days old).
+  Capped at 10 rows, most critical first.
+- **Overdue** (`isOverdueTask`) and the Upcoming Deadlines Overdue/Due
+  Today/Due This Week split both compare **calendar days**, not exact
+  timestamps (`isPastCalendarDay`/`isSameCalendarDay`) — task deadlines are
+  stored as midnight-of-day values, so an exact `Before(now)` check would
+  make "Due Today" unreachable (a deadline stored at today's 00:00 is
+  "before now" the instant any time at all has passed today). Bug caught
+  and fixed during initial smoke testing — see the same rule applied to
+  `planEndPassed` in the Health computation for consistency.
+- **Load status** (`loadStatus`): Berat (active>5 or hours>35 or overdue>0)
+  > Sedang (active 3-5 or hours 20-35) > Ringan — checked heaviest-first so
+  any single qualifying condition escalates.
+
+**Graceful-empty-data guarantees** (per the task's explicit requirement):
+every repository call in `DashboardSummary()` past the first
+(`PmPortfolioProjects`) degrades to an empty slice on error rather than
+failing the whole response; every numeric field defaults to 0 via Go's
+zero-value semantics (no manual "if empty" branching needed) — confirmed
+against both a project with real tasks/time-logs and (by code review, no
+panics possible: every map/slice access is nil-safe, every division is
+length-guarded) the true zero-data case.
+
+Smoke-tested against the shared staging DB (2026-07-22): `curl
+localhost:4000/api/v1/pm/dashboard/summary` — 8 real PM projects, correct
+Stage/Health tallies, `attentionNeeded` correctly ranked Blocked-first, no
+active work sessions (empty array, no error), `recentActivity` showing real
+task-activity-log rows (created/status changes/manual work logs).
+
 ## Stage label: 'Fieldwork' renamed to 'In Progress' (2026-07-22)
 
 `taskStageCaseSQL`'s progress-tasks branch now emits `'In Progress'` instead

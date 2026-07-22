@@ -3,6 +3,8 @@ package service
 import (
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -64,6 +66,13 @@ type ServiceInterface interface {
 	CreateTimesheet(req model.TimesheetRequest) (model.Row, error)
 	UpdateTimesheetStatus(id int64, status string, approvedBy *int64) (model.Row, error)
 	DeleteTimesheet(id int64) error
+
+	// DashboardSummary powers /v1/pm/dashboard/summary — the high-level PM
+	// portfolio monitoring dashboard (project health, portfolio progress,
+	// team workload, active work sessions, upcoming deadlines, recent
+	// activity). See the doc comment on the implementation for the exact
+	// response shape and every derivation rule.
+	DashboardSummary() (model.Row, error)
 }
 
 type pmService struct {
@@ -1288,6 +1297,528 @@ func (s *pmService) UpdateTimesheetStatus(id int64, status string, approvedBy *i
 
 func (s *pmService) DeleteTimesheet(id int64) error {
 	return s.Repository.DeleteTimesheet(id)
+}
+
+// ─── PM Dashboard summary (/v1/pm/dashboard/summary) ───────────────────────
+//
+// High-level portfolio monitoring for /pm/dashboard. Every number here is
+// derived from PmPortfolioProjects/PmPortfolioTasks/PmActiveWorkSessions/
+// PmWeeklySecondsByUser/PmMembersForWorkload/PmRecentActivity — no field is
+// ever hardcoded or estimated without a documented rule. Response is a plain
+// model.Row (matching every other PM endpoint's convention) built with the
+// exact key names the frontend contract expects (see CLAUDE.md).
+//
+// Stage is read straight off PmPortfolioProjects' `stage` column (the same
+// taskStageCaseSQL CASE used by CrmProjects/CrmProjectByID) — never
+// re-derived here, so /pm/dashboard and /pm/projects can never disagree on
+// a project's Stage. "In Progress" was previously labeled "Fieldwork";
+// taskStageCaseSQL already only ever emits "In Progress" (see the 2026-07-22
+// rename note on that const) so no normalization is needed on this side.
+//
+// Planned progress is new (no prior metric in this codebase derives it): the
+// percentage of a project's plan_start->plan_end window that has elapsed as
+// of now, clamped 0-100. A project with no plan window at all (brand new,
+// no tasks, no CRM start/end dates) reports 0 rather than being excluded,
+// so portfolio averages still divide by every project consistently.
+//
+// Actual progress reuses computeTaskProgress/projectProgressFromTasks
+// verbatim (the same helpers CrmProjects/CrmProjectDetail/TasksByCrmProject
+// use) — the single source of truth for "how much of this project's active
+// work is actually done".
+func (s *pmService) DashboardSummary() (model.Row, error) {
+	projects, err := s.Repository.PmPortfolioProjects()
+	if err != nil {
+		return nil, err
+	}
+	tasks, err := s.Repository.PmPortfolioTasks()
+	if err != nil {
+		tasks = []model.Row{}
+	}
+	members, err := s.Repository.PmMembersForWorkload()
+	if err != nil {
+		members = []model.Row{}
+	}
+	// Graceful fallback per the backend requirements: if the time-log or
+	// activity-log tables/queries are ever unavailable, the dashboard still
+	// renders with zeroed/empty sections instead of a hard 500.
+	activeSessions, err := s.Repository.PmActiveWorkSessions()
+	if err != nil {
+		activeSessions = []model.Row{}
+	}
+	weeklySeconds, err := s.Repository.PmWeeklySecondsByUser()
+	if err != nil {
+		weeklySeconds = []model.Row{}
+	}
+	recentActivity, err := s.Repository.PmRecentActivity(10)
+	if err != nil {
+		recentActivity = []model.Row{}
+	}
+
+	now := time.Now()
+
+	// Only PM-portfolio (Advisory/Audit Program) projects' own tasks count
+	// toward stage/health/progress/attention — a task somehow pointing at a
+	// crm_project_id outside that scope (shouldn't happen, but PmPortfolioTasks
+	// is intentionally unscoped for reuse) never leaks into these metrics.
+	scopedProjectIDs := make(map[int64]bool, len(projects))
+	projectTitleByID := make(map[int64]string, len(projects))
+	for _, p := range projects {
+		pid, _ := toInt64(p["crm_project_id"])
+		scopedProjectIDs[pid] = true
+		projectTitleByID[pid] = str(p["title"])
+	}
+
+	tasksByProject := make(map[int64][]model.Row, len(projects))
+	for _, t := range tasks {
+		pid, _ := toInt64(t["crm_project_id"])
+		if !scopedProjectIDs[pid] {
+			continue
+		}
+		tasksByProject[pid] = append(tasksByProject[pid], t)
+	}
+
+	// weeklySecondsByUser / activeSessionByUser index the two time-log
+	// queries by user id — activeSessions is guaranteed at-most-one-per-user
+	// by the DB's unique partial index (migration 013), so a plain map
+	// assignment (not append) is safe.
+	weeklySecondsByUser := make(map[int64]int64, len(weeklySeconds))
+	for _, row := range weeklySeconds {
+		uid, _ := toInt64(row["user_id"])
+		seconds, _ := toInt64(row["total_seconds"])
+		weeklySecondsByUser[uid] = seconds
+	}
+	activeSessionByUser := make(map[int64]model.Row, len(activeSessions))
+	for _, row := range activeSessions {
+		uid, _ := toInt64(row["user_id"])
+		activeSessionByUser[uid] = row
+	}
+
+	type projectMetrics struct {
+		row              model.Row
+		stage            string
+		health           string
+		actualProgress   int64
+		plannedProgress  int64
+		overdueTaskCount int64
+		issue            string
+		issueRank        int
+	}
+
+	metrics := make([]projectMetrics, 0, len(projects))
+	var totalOpenTasks, totalDoneTasksAllProjects, totalTasksAllProjects int64
+	var sumPlanned, sumActual int64
+
+	for _, p := range projects {
+		pid, _ := toInt64(p["crm_project_id"])
+		projectTasks := tasksByProject[pid]
+
+		stage := str(p["stage"])
+		blockedTasks, _ := toInt64(p["blocked_tasks"])
+		totalTasks, _ := toInt64(p["total_tasks"])
+		doneTasks, _ := toInt64(p["done_tasks"])
+
+		progress := computeTaskProgress(projectTasks)
+		actualProgress := projectProgressFromTasks(projectTasks, progress)
+		plannedProgress := planProgressPercent(timeFromRow(p["plan_start"]), timeFromRow(p["plan_end"]), now)
+
+		var overdueTaskCount int64
+		for _, t := range projectTasks {
+			if isOverdueTask(t, now) {
+				overdueTaskCount++
+			}
+			if normalizeTaskStatusKey(str(t["status"])) != "done" {
+				totalOpenTasks++
+			}
+		}
+		totalDoneTasksAllProjects += doneTasks
+		totalTasksAllProjects += totalTasks
+		sumPlanned += plannedProgress
+		sumActual += actualProgress
+
+		planEndPassed := false
+		if planEnd := timeFromRow(p["plan_end"]); planEnd != nil && isPastCalendarDay(*planEnd, now) {
+			planEndPassed = true
+		}
+
+		health := "Healthy"
+		switch {
+		case blockedTasks > 0 || stage == "Blocked":
+			health = "Blocked"
+		case overdueTaskCount > 0 || (planEndPassed && stage != "Completed") || actualProgress < plannedProgress:
+			health = "At Risk"
+		}
+
+		// Issue priority for Attention Needed: Blocked > Overdue > Behind
+		// plan > No recent update. Only one issue is surfaced per project
+		// (the most critical applicable one) — a project can technically
+		// match more than one, but showing the single worst signal is what
+		// keeps the table scannable.
+		issue, issueRank := "", -1
+		updatedAt := timeFromRow(p["updated_at"])
+		staleUpdate := updatedAt != nil && now.Sub(*updatedAt) > 14*24*time.Hour
+		switch {
+		case blockedTasks > 0 || stage == "Blocked":
+			issue, issueRank = "Blocked", 0
+		case overdueTaskCount > 0 || (planEndPassed && stage != "Completed"):
+			issue, issueRank = "Overdue", 1
+		case actualProgress < plannedProgress && stage != "Completed":
+			issue, issueRank = "Behind plan", 2
+		case staleUpdate && stage != "Completed":
+			issue, issueRank = "No recent update", 3
+		}
+
+		metrics = append(metrics, projectMetrics{
+			row: p, stage: stage, health: health,
+			actualProgress: actualProgress, plannedProgress: plannedProgress,
+			overdueTaskCount: overdueTaskCount, issue: issue, issueRank: issueRank,
+		})
+	}
+
+	// ── Summary cards ──────────────────────────────────────────────────
+	var activeProjects, completedProjects, blockedProjects, overdueProjects int64
+	peopleSet := map[int64]bool{}
+	for _, t := range tasks {
+		pid, _ := toInt64(t["crm_project_id"])
+		if !scopedProjectIDs[pid] {
+			continue
+		}
+		if uid, ok := toInt64(t["assigned_to"]); ok && uid != 0 {
+			peopleSet[uid] = true
+		}
+	}
+	for _, m := range metrics {
+		switch m.stage {
+		case "Completed":
+			completedProjects++
+		case "Blocked":
+			blockedProjects++
+		default:
+			activeProjects++
+		}
+		if m.overdueTaskCount > 0 || m.issue == "Overdue" {
+			overdueProjects++
+		}
+	}
+	var totalWeeklySeconds int64
+	for _, seconds := range weeklySecondsByUser {
+		totalWeeklySeconds += seconds
+	}
+
+	summary := model.Row{
+		"totalProjects":     int64(len(projects)),
+		"activeProjects":    activeProjects,
+		"completedProjects": completedProjects,
+		"blockedProjects":   blockedProjects,
+		"overdueProjects":   overdueProjects,
+		"totalOpenTasks":    totalOpenTasks,
+		"peopleInvolved":    int64(len(peopleSet)),
+		"workHoursThisWeek": roundTo1(float64(totalWeeklySeconds) / 3600.0),
+	}
+
+	// ── Stage / Health overview ────────────────────────────────────────
+	stageCounts := map[string]int64{"Planning": 0, "In Progress": 0, "Review": 0, "Blocked": 0, "Completed": 0}
+	healthCounts := map[string]int64{"Healthy": 0, "At Risk": 0, "Blocked": 0}
+	for _, m := range metrics {
+		if _, ok := stageCounts[m.stage]; ok {
+			stageCounts[m.stage]++
+		}
+		healthCounts[m.health]++
+	}
+	stageOrder := []string{"Planning", "In Progress", "Review", "Blocked", "Completed"}
+	stageOverview := make([]model.Row, 0, len(stageOrder))
+	for _, st := range stageOrder {
+		stageOverview = append(stageOverview, model.Row{"stage": st, "count": stageCounts[st]})
+	}
+	healthOrder := []string{"Healthy", "At Risk", "Blocked"}
+	healthOverview := make([]model.Row, 0, len(healthOrder))
+	for _, h := range healthOrder {
+		healthOverview = append(healthOverview, model.Row{"health": h, "count": healthCounts[h]})
+	}
+
+	// ── Portfolio progress ─────────────────────────────────────────────
+	var avgPlanned, avgActual float64
+	if len(metrics) > 0 {
+		avgPlanned = float64(sumPlanned) / float64(len(metrics))
+		avgActual = float64(sumActual) / float64(len(metrics))
+	}
+	portfolioProgress := model.Row{
+		"averagePlannedProgress": roundTo1(avgPlanned),
+		"averageActualProgress":  roundTo1(avgActual),
+		"averageVariance":        roundTo1(avgActual - avgPlanned),
+		"completedTasks":         totalDoneTasksAllProjects,
+		"totalTasks":             totalTasksAllProjects,
+	}
+
+	// ── Attention Needed (top 10, most critical first) ─────────────────
+	attention := make([]projectMetrics, 0, len(metrics))
+	for _, m := range metrics {
+		if m.issue != "" {
+			attention = append(attention, m)
+		}
+	}
+	sort.SliceStable(attention, func(i, j int) bool { return attention[i].issueRank < attention[j].issueRank })
+	if len(attention) > 10 {
+		attention = attention[:10]
+	}
+	attentionNeeded := make([]model.Row, 0, len(attention))
+	for _, m := range attention {
+		pid, _ := toInt64(m.row["crm_project_id"])
+		attentionNeeded = append(attentionNeeded, model.Row{
+			"projectId":    pid,
+			"projectTitle": m.row["title"],
+			"picName":      strFromAny(m.row["pic"], strFromAny(m.row["owner"], strFromAny(m.row["owner_name"], ""))),
+			"stage":        m.stage,
+			"progress":     m.actualProgress,
+			"deadline":     m.row["plan_end"],
+			"issue":        m.issue,
+		})
+	}
+
+	// ── Team workload ───────────────────────────────────────────────────
+	tasksByUser := make(map[int64][]model.Row, len(members))
+	for _, t := range tasks {
+		uid, ok := toInt64(t["assigned_to"])
+		if !ok || uid == 0 {
+			continue
+		}
+		tasksByUser[uid] = append(tasksByUser[uid], t)
+	}
+	teamWorkload := make([]model.Row, 0, len(members))
+	for _, member := range members {
+		uid, _ := toInt64(member["id"])
+		userTasks := tasksByUser[uid]
+		var active, inProgress, overdue int64
+		for _, t := range userTasks {
+			statusKey := normalizeTaskStatusKey(str(t["status"]))
+			if statusKey != "done" {
+				active++
+			}
+			if statusKey == "in_progress" {
+				inProgress++
+			}
+			if isOverdueTask(t, now) {
+				overdue++
+			}
+		}
+		hoursThisWeek := roundTo1(float64(weeklySecondsByUser[uid]) / 3600.0)
+
+		var currentClockIn interface{}
+		if session, ok := activeSessionByUser[uid]; ok {
+			taskType := "task"
+			if toBool(session["is_subtask"]) {
+				taskType = "subtask"
+			}
+			spid, _ := toInt64(session["project_id"])
+			currentClockIn = model.Row{
+				"taskId":       session["task_id"],
+				"taskTitle":    session["task_title"],
+				"projectId":    spid,
+				"projectTitle": session["project_title"],
+				"startedAt":    session["started_at"],
+				"taskType":     taskType,
+			}
+		}
+
+		teamWorkload = append(teamWorkload, model.Row{
+			"userId":          uid,
+			"memberName":      member["name"],
+			"jobTitle":        strFromAny(member["job_title"], ""),
+			"activeTasks":     active,
+			"inProgressTasks": inProgress,
+			"overdueTasks":    overdue,
+			"hoursThisWeek":   hoursThisWeek,
+			"currentClockIn":  currentClockIn,
+			"loadStatus":      loadStatus(active, overdue, hoursThisWeek),
+		})
+	}
+
+	// ── Active work sessions ────────────────────────────────────────────
+	activeWorkSessions := make([]model.Row, 0, len(activeSessions))
+	for _, session := range activeSessions {
+		uid, _ := toInt64(session["user_id"])
+		pid, _ := toInt64(session["project_id"])
+		taskType := "task"
+		if toBool(session["is_subtask"]) {
+			taskType = "subtask"
+		}
+		activeWorkSessions = append(activeWorkSessions, model.Row{
+			"userId":         uid,
+			"memberName":     session["member_name"],
+			"projectId":      pid,
+			"projectTitle":   session["project_title"],
+			"taskId":         session["task_id"],
+			"taskTitle":      session["task_title"],
+			"taskType":       taskType,
+			"startedAt":      session["started_at"],
+			"elapsedSeconds": elapsedSecondsFrom(session["started_at"]),
+		})
+	}
+
+	// ── Upcoming deadlines (tasks only; capped at 15) ──────────────────
+	type deadlineItem struct {
+		row    model.Row
+		due    time.Time
+		status string
+		rank   int
+	}
+	deadlineItems := make([]deadlineItem, 0)
+	weekFromNow := now.Add(7 * 24 * time.Hour)
+	for _, t := range tasks {
+		if normalizeTaskStatusKey(str(t["status"])) == "done" {
+			continue
+		}
+		due := timeFromRow(t["deadline"])
+		if due == nil {
+			continue
+		}
+		var status string
+		var rank int
+		switch {
+		case isPastCalendarDay(*due, now):
+			status, rank = "Overdue", 0
+		case isSameCalendarDay(*due, now):
+			status, rank = "Due Today", 1
+		case due.Before(weekFromNow):
+			status, rank = "Due This Week", 2
+		default:
+			continue
+		}
+		deadlineItems = append(deadlineItems, deadlineItem{row: t, due: *due, status: status, rank: rank})
+	}
+	sort.SliceStable(deadlineItems, func(i, j int) bool {
+		if deadlineItems[i].rank != deadlineItems[j].rank {
+			return deadlineItems[i].rank < deadlineItems[j].rank
+		}
+		return deadlineItems[i].due.Before(deadlineItems[j].due)
+	})
+	if len(deadlineItems) > 15 {
+		deadlineItems = deadlineItems[:15]
+	}
+	upcomingDeadlines := make([]model.Row, 0, len(deadlineItems))
+	for _, d := range deadlineItems {
+		pid, _ := toInt64(d.row["crm_project_id"])
+		itemType := "task"
+		if str(d.row["parent_task_id"]) != "" {
+			itemType = "subtask"
+		}
+		upcomingDeadlines = append(upcomingDeadlines, model.Row{
+			"type":         itemType,
+			"itemId":       d.row["id"],
+			"itemTitle":    d.row["title"],
+			"projectId":    pid,
+			"projectTitle": projectTitleByID[pid],
+			"ownerName":    strFromAny(d.row["assignee_name"], ""),
+			"dueDate":      d.row["deadline"],
+			"status":       d.status,
+		})
+	}
+
+	// ── Recent activity ────────────────────────────────────────────────
+	recent := make([]model.Row, 0, len(recentActivity))
+	for _, a := range recentActivity {
+		pid, _ := toInt64(a["project_id"])
+		recent = append(recent, model.Row{
+			"id":          a["id"],
+			"actorName":   strFromAny(a["actor_name"], "System"),
+			"action":      a["action"],
+			"description": a["description"],
+			"projectId":   pid,
+			"taskId":      a["task_id"],
+			"createdAt":   a["created_at"],
+		})
+	}
+
+	return model.Row{
+		"summary":            summary,
+		"stageOverview":      stageOverview,
+		"healthOverview":     healthOverview,
+		"portfolioProgress":  portfolioProgress,
+		"attentionNeeded":    attentionNeeded,
+		"teamWorkload":       teamWorkload,
+		"activeWorkSessions": activeWorkSessions,
+		"upcomingDeadlines":  upcomingDeadlines,
+		"recentActivity":     recent,
+	}, nil
+}
+
+// planProgressPercent is the "planned progress" side of Portfolio Progress:
+// how far through a project's plan_start->plan_end window `now` falls,
+// clamped 0-100. Returns 0 if either bound is missing or the window is
+// zero/negative-length (can't divide by zero, and a same-day plan window
+// isn't meaningful to interpolate) — a project with no usable plan window
+// simply contributes 0 rather than being excluded from portfolio averages.
+func planProgressPercent(planStart, planEnd *time.Time, now time.Time) int64 {
+	if planStart == nil || planEnd == nil {
+		return 0
+	}
+	total := planEnd.Sub(*planStart)
+	if total <= 0 {
+		return 0
+	}
+	if now.Before(*planStart) {
+		return 0
+	}
+	if !now.Before(*planEnd) {
+		return 100
+	}
+	elapsed := now.Sub(*planStart)
+	pct := int64((elapsed.Seconds() / total.Seconds()) * 100)
+	return clampPercent(pct)
+}
+
+// isOverdueTask: has a deadline whose calendar day has already fully passed
+// and isn't done yet. Mirrors the LOWER(status) tolerance taskStageJoinSQL
+// uses elsewhere in this file, via normalizeTaskStatusKey (folds 'completed'
+// into 'done'). Calendar-day (not exact-timestamp) comparison matters
+// because task deadlines are stored as midnight-of-day values — an exact
+// due.Before(now) would flag a task as "overdue" the instant any time at
+// all has passed today, making "Due Today" effectively unreachable.
+func isOverdueTask(t model.Row, now time.Time) bool {
+	if normalizeTaskStatusKey(str(t["status"])) == "done" {
+		return false
+	}
+	due := timeFromRow(t["deadline"])
+	return due != nil && isPastCalendarDay(*due, now)
+}
+
+// isPastCalendarDay/isSameCalendarDay compare only the Y/M/D of two
+// timestamps (ignoring time-of-day) — see isOverdueTask's doc comment for
+// why this matters given midnight-stored deadlines.
+func isPastCalendarDay(t, now time.Time) bool {
+	ty, tm, td := t.Date()
+	ny, nm, nd := now.Date()
+	if ty != ny {
+		return ty < ny
+	}
+	if tm != nm {
+		return tm < nm
+	}
+	return td < nd
+}
+
+func isSameCalendarDay(t, now time.Time) bool {
+	ty, tm, td := t.Date()
+	ny, nm, nd := now.Date()
+	return ty == ny && tm == nm && td == nd
+}
+
+// loadStatus implements the dashboard's initial Team Workload thresholds
+// (Ringan/Sedang/Berat), checked heaviest-first so any single qualifying
+// condition is enough to escalate — e.g. zero active tasks but 40 tracked
+// hours this week (a big single task) still reports Berat.
+func loadStatus(activeTasks, overdueTasks int64, hoursThisWeek float64) string {
+	switch {
+	case activeTasks > 5 || hoursThisWeek > 35 || overdueTasks > 0:
+		return "Berat"
+	case activeTasks >= 3 || hoursThisWeek >= 20:
+		return "Sedang"
+	default:
+		return "Ringan"
+	}
+}
+
+func roundTo1(v float64) float64 {
+	return math.Round(v*10) / 10
 }
 
 func strFromAny(v interface{}, fallback string) string {

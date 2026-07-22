@@ -434,6 +434,18 @@ func (pc *pmController) GanttMembers(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, data)
 }
 
+// DashboardSummary powers /pm/dashboard — the high-level PM portfolio
+// monitoring dashboard (project health, portfolio progress, team workload,
+// active work sessions, upcoming deadlines, recent activity).
+func (pc *pmController) DashboardSummary(ctx *gin.Context) {
+	data, err := pc.Service.DashboardSummary()
+	if err != nil {
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
 // ClockInTask handles POST /tasks/:id/clock-in — body: { userId, actorUserId? }.
 func (pc *pmController) ClockInTask(ctx *gin.Context) {
 	taskID := ctx.Param("id")

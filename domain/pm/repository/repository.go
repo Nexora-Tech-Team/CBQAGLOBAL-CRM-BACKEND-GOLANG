@@ -103,6 +103,17 @@ type RepositoryInterface interface {
 	InsertTimesheet(fields map[string]interface{}) (int64, error)
 	UpdateTimesheetStatus(id int64, status string, approvedBy *int64) error
 	DeleteTimesheet(id int64) error
+
+	// PM Dashboard summary (/v1/pm/dashboard/summary) — high-level portfolio
+	// monitoring aggregation. Each method below returns one flat, reusable
+	// dataset; the service layer joins them in memory (same N+1-avoidance
+	// pattern as CrmProjects + ActiveTaskProgressInputs).
+	PmPortfolioProjects() ([]model.Row, error)
+	PmPortfolioTasks() ([]model.Row, error)
+	PmMembersForWorkload() ([]model.Row, error)
+	PmActiveWorkSessions() ([]model.Row, error)
+	PmWeeklySecondsByUser() ([]model.Row, error)
+	PmRecentActivity(limit int) ([]model.Row, error)
 }
 
 type repository struct {
@@ -1249,6 +1260,187 @@ func (r *repository) UpdateTimesheetStatus(id int64, status string, approvedBy *
 
 func (r *repository) DeleteTimesheet(id int64) error {
 	return r.DB.Exec(`UPDATE pm_timesheets SET deleted = TRUE, updated_at = NOW() WHERE id = ?`, id).Error
+}
+
+// ─── PM Dashboard summary (/v1/pm/dashboard/summary) ───────────────────────
+
+// planWindowJoinSQL aggregates each project's task-level plan_start/plan_end
+// window (MIN(start_date)/MAX(deadline) across its active tasks) in one
+// grouped pass, mirroring taskStageJoinSQL's shape/rationale. The service
+// layer falls back to the project's own project_date/valid_until when a
+// project has no tasks yet (see PmPortfolioProjects' COALESCE below) so a
+// brand-new Planning project still has a usable plan window for the
+// planned-vs-actual progress comparison.
+const planWindowJoinSQL = `
+		LEFT JOIN (
+		  SELECT crm_project_id,
+		         MIN(start_date) AS min_start_date,
+		         MAX(deadline) AS max_deadline
+		  FROM pm_project_tasks
+		  WHERE deleted = FALSE
+		  GROUP BY crm_project_id
+		) plan_window ON plan_window.crm_project_id = p.id`
+
+// PmPortfolioProjects returns one row per CRM-linked PM project (same
+// Advisory/Audit Program service scope as CrmProjects) with everything the
+// dashboard needs to derive Stage, Health, and the planned-progress side of
+// Portfolio Progress without a second per-project query: the task_stage
+// counts (reused from taskStageJoinSQL/taskStageCaseSQL — Stage must never
+// be re-derived differently in two places), and the plan_start/plan_end
+// window. Actual progress is intentionally NOT computed here — it comes
+// from PmPortfolioTasks + the existing computeTaskProgress/
+// projectProgressFromTasks helpers, so list/detail/dashboard progress can
+// never disagree.
+func (r *repository) PmPortfolioProjects() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT DISTINCT
+		  p.id AS crm_project_id,
+		  p.id,
+		  p.project_date,
+		  COALESCE(l.project_name, c.company_name) AS title,
+		  p.assigned_to AS owner_name,
+		  NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), '') AS owner,
+		  NULLIF(TRIM(COALESCE(pu.first_name, '') || ' ' || COALESCE(pu.last_name, '')), '') AS pic,
+		  ` + taskStageCaseSQL + `,
+		  COALESCE(task_stage.total_tasks, 0) AS total_tasks,
+		  COALESCE(task_stage.blocked_tasks, 0) AS blocked_tasks,
+		  COALESCE(task_stage.done_tasks, 0) AS done_tasks,
+		  COALESCE(task_stage.review_tasks, 0) AS review_tasks,
+		  COALESCE(task_stage.progress_tasks, 0) AS progress_tasks,
+		  COALESCE(plan_window.min_start_date, p.project_date) AS plan_start,
+		  COALESCE(plan_window.max_deadline, p.valid_until) AS plan_end,
+		  GREATEST(
+		    p.updated_at,
+		    (SELECT MAX(t.updated_at) FROM pm_project_tasks t WHERE t.crm_project_id = p.id AND t.deleted = FALSE)
+		  ) AS updated_at
+		FROM projects p
+		JOIN leads l ON l.id = p.lead_id
+		JOIN companies c ON c.id = l.company_id
+		JOIN project_services ps ON ps.project_id = p.id
+		JOIN services s ON s.id = ps.service_id
+		LEFT JOIN users cu ON cu.id = p.cuser_id
+		LEFT JOIN pm_projects pm ON pm.crm_project_id = p.id AND pm.deleted = FALSE
+		LEFT JOIN users pu ON pu.id = pm.pic_user_id
+		` + taskStageJoinSQL + `
+		` + planWindowJoinSQL + `
+		WHERE s.name IN ('Advisory', 'Audit Program')
+		ORDER BY p.project_date DESC NULLS LAST
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmPortfolioTasks returns every non-deleted PM task (unscoped by project,
+// same rationale as ActiveTaskProgressInputs — this table is small enough
+// that one flat fetch + in-memory grouping beats a per-project query) with
+// the extra columns (title, deadline, assigned_to/assignee_name) the
+// dashboard needs for team workload, overdue detection, and upcoming
+// deadlines, on top of the id/parent_task_id/status/progress_pct shape
+// ActiveTaskProgressInputs already exposes for computeTaskProgress.
+func (r *repository) PmPortfolioTasks() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT t.id::text AS id, t.crm_project_id, t.parent_task_id::text AS parent_task_id,
+		       t.status, t.progress_pct, t.title, t.deadline, t.assigned_to,
+		       NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS assignee_name
+		FROM pm_project_tasks t
+		LEFT JOIN users u ON u.id = t.assigned_to
+		WHERE t.deleted = FALSE
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmMembersForWorkload is GanttMembers' exact WHERE clause (IT Audit
+// department, active internal users) plus job_title, added as a separate
+// method rather than widening GanttMembers itself so the existing
+// assignee-picker endpoint's shape/behavior can't drift by accident.
+func (r *repository) PmMembersForWorkload() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT DISTINCT u.id, TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name,
+		       u.job_title, u.employee_id AS code, u.email
+		FROM users u
+		INNER JOIN departements d ON d.id = u.departement_id
+		WHERE u.dtype = 'INTERNAL_USER' AND (u.status IS NULL OR u.status <> '0')
+		  AND d.name = 'IT Audit'
+		ORDER BY name ASC
+		LIMIT 500
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmActiveWorkSessions lists every currently open (ended_at IS NULL) time
+// log across ALL users — the org-wide "who's clocked in right now" view.
+// Unlike ActiveTimeLogForUser (scoped to one user, used by the Work Timer
+// widget), this powers both the dashboard's Active Work Sessions panel and
+// each Team Workload row's currentClockIn. The unique partial index backing
+// ClockIn guarantees at most one open row per user, so grouping this result
+// by user_id in the service layer is safe.
+func (r *repository) PmActiveWorkSessions() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT tl.user_id, tl.task_id::text AS task_id, tl.project_id, tl.started_at,
+		       NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS member_name,
+		       t.title AS task_title,
+		       (t.parent_task_id IS NOT NULL) AS is_subtask,
+		       COALESCE(l.project_name, c.company_name) AS project_title
+		FROM pm_task_time_logs tl
+		LEFT JOIN users u ON u.id = tl.user_id
+		LEFT JOIN pm_project_tasks t ON t.id = tl.task_id
+		LEFT JOIN projects p ON p.id = tl.project_id
+		LEFT JOIN leads l ON l.id = p.lead_id
+		LEFT JOIN companies c ON c.id = l.company_id
+		WHERE tl.ended_at IS NULL AND tl.deleted_at IS NULL
+		ORDER BY tl.started_at ASC
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmWeeklySecondsByUser sums each user's tracked time for the current
+// calendar week (date_trunc('week', NOW()), matching TimesheetSummary's own
+// week-bucketing convention so the two "hours this week" concepts in this
+// codebase stay defined the same way): closed sessions contribute their
+// stored duration_seconds when they STARTED this week, and any still-open
+// session contributes its live elapsed time regardless of when it started
+// (a session spanning a week boundary is a rare edge case; counting its
+// running total against the current week is the more useful "what's
+// happening right now" answer for a live dashboard than splitting it).
+func (r *repository) PmWeeklySecondsByUser() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT user_id,
+		  COALESCE(SUM(duration_seconds) FILTER (
+		    WHERE ended_at IS NOT NULL AND started_at >= date_trunc('week', NOW())
+		  ), 0)
+		  + COALESCE(SUM(EXTRACT(EPOCH FROM (NOW() - started_at))::bigint) FILTER (
+		    WHERE ended_at IS NULL
+		  ), 0) AS total_seconds
+		FROM pm_task_time_logs
+		WHERE deleted_at IS NULL
+		GROUP BY user_id
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmRecentActivity is TaskActivityLogs widened from "one task" to "every
+// task, most recent first" — the dashboard's Recent Activity feed. Returns
+// whatever action/description rows actually exist (created/subtask_created/
+// updated+field_name/clock_in/clock_out/manual_log_*/deleted, see
+// logTaskActivity call sites in service.go); there is currently no
+// project-level "project updated" or "member added" entry logged anywhere
+// in this codebase, so those categories simply won't appear until/unless
+// UpdateCrmProject and InsertCrmProjectMember start logging too — never
+// fabricated here.
+func (r *repository) PmRecentActivity(limit int) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT id, task_id::text AS task_id, project_id, actor_user_id, actor_name,
+		       action, field_name, old_value, new_value, description, created_at
+		FROM pm_task_activity_logs
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, limit).Scan(&rows).Error
+	return rows, err
 }
 
 func buildInsert(fields map[string]interface{}) (columns string, placeholders string, values []interface{}) {
