@@ -446,6 +446,25 @@ func (pc *pmController) DashboardSummary(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, data)
 }
 
+// TeamWorkloadByPeriod powers the Team Workload section's period filter —
+// GET /dashboard/team-workload?period=this_week|this_month|custom_month
+// (&month=YYYY-MM when period=custom_month). `period` defaults to
+// this_week when omitted, matching the frontend's default selection.
+func (pc *pmController) TeamWorkloadByPeriod(ctx *gin.Context) {
+	period := ctx.DefaultQuery("period", "this_week")
+	month := ctx.Query("month")
+	data, err := pc.Service.TeamWorkloadByPeriod(period, month)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidWorkloadPeriod) {
+			response.Error(ctx, http.StatusBadRequest, err.Error())
+			return
+		}
+		response.Error(ctx, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
 // ClockInTask handles POST /tasks/:id/clock-in — body: { userId, actorUserId? }.
 func (pc *pmController) ClockInTask(ctx *gin.Context) {
 	taskID := ctx.Param("id")

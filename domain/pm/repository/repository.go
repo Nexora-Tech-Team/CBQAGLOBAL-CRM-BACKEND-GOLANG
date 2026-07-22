@@ -114,6 +114,13 @@ type RepositoryInterface interface {
 	PmActiveWorkSessions() ([]model.Row, error)
 	PmWeeklySecondsByUser() ([]model.Row, error)
 	PmRecentActivity(limit int) ([]model.Row, error)
+
+	// Team Workload period filter (/v1/pm/dashboard/team-workload,
+	// 2026-07-22) — same "one flat query per shape, join in memory" pattern
+	// as the block above, parameterized by an arbitrary [start, end) range
+	// instead of always being this-calendar-week.
+	PmWorkloadSecondsByUserForRange(start, end time.Time) ([]model.Row, error)
+	PmCompletedTasksByUserForRange(start, end time.Time) ([]model.Row, error)
 }
 
 type repository struct {
@@ -1440,6 +1447,53 @@ func (r *repository) PmRecentActivity(limit int) ([]model.Row, error) {
 		ORDER BY created_at DESC, id DESC
 		LIMIT ?
 	`, limit).Scan(&rows).Error
+	return rows, err
+}
+
+// PmWorkloadSecondsByUserForRange sums each user's CLOSED time-log sessions
+// (ended_at IS NOT NULL, so both finished realtime clock sessions and manual
+// work logs — a manual entry is always inserted already-closed) whose
+// started_at falls in [start, end). Deliberately does NOT add any
+// still-open session's live elapsed time — unlike PmWeeklySecondsByUser
+// (the always-"this week" summary card, which does include the running
+// session for a "what's happening right now" feel), a period-scoped report
+// should show a stable, reproducible number that doesn't change every
+// second while a session is still in progress. See CLAUDE.md for the full
+// rationale ("the safest option" the task asked for).
+func (r *repository) PmWorkloadSecondsByUserForRange(start, end time.Time) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT user_id, COALESCE(SUM(duration_seconds), 0) AS period_seconds
+		FROM pm_task_time_logs
+		WHERE deleted_at IS NULL
+		  AND ended_at IS NOT NULL
+		  AND started_at >= ? AND started_at < ?
+		GROUP BY user_id
+	`, start, end).Scan(&rows).Error
+	return rows, err
+}
+
+// PmCompletedTasksByUserForRange counts each assignee's tasks that became
+// Done within [start, end), keyed off status_changed_at (the same column
+// MoveProjectTaskByKey/UpdateProjectTask already stamp on every status
+// transition — no new column needed). Best-effort: status_changed_at only
+// holds the LATEST transition, so a task that went Done then got reopened
+// then Done again within the same window is still counted once, correctly;
+// one that was completed in a past period and never touched again keeps
+// its original status_changed_at and correctly stops counting once the
+// period moves on.
+func (r *repository) PmCompletedTasksByUserForRange(start, end time.Time) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT assigned_to AS user_id, COUNT(*) AS completed_tasks
+		FROM pm_project_tasks
+		WHERE deleted = FALSE
+		  AND LOWER(status) IN ('done', 'completed')
+		  AND status_changed_at IS NOT NULL
+		  AND status_changed_at >= ? AND status_changed_at < ?
+		  AND assigned_to IS NOT NULL
+		GROUP BY assigned_to
+	`, start, end).Scan(&rows).Error
 	return rows, err
 }
 

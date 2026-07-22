@@ -15,6 +15,11 @@ import (
 	"erp-cbqa-global/domain/pm/repository"
 )
 
+// ErrInvalidWorkloadPeriod marks a bad `period`/`month` query param on
+// GET /v1/pm/dashboard/team-workload — the controller maps this to 400,
+// any other error from that path to 500.
+var ErrInvalidWorkloadPeriod = errors.New("invalid workload period")
+
 type ServiceInterface interface {
 	Dashboard(crmProjectID, memberID *int64) (model.Row, error)
 	Statuses() ([]model.Row, error)
@@ -73,6 +78,14 @@ type ServiceInterface interface {
 	// activity). See the doc comment on the implementation for the exact
 	// response shape and every derivation rule.
 	DashboardSummary() (model.Row, error)
+
+	// TeamWorkloadByPeriod powers /v1/pm/dashboard/team-workload — the same
+	// Team Workload data as DashboardSummary's teamWorkload, but scoped to
+	// an arbitrary period (this_week/this_month/custom_month) instead of
+	// always being the current calendar week. See the implementation's doc
+	// comment for period resolution rules and CLAUDE.md for the full
+	// formula writeup.
+	TeamWorkloadByPeriod(periodType, monthParam string) (model.Row, error)
 }
 
 type pmService struct {
@@ -1739,6 +1752,253 @@ func (s *pmService) DashboardSummary() (model.Row, error) {
 		"upcomingDeadlines":  upcomingDeadlines,
 		"recentActivity":     recent,
 	}, nil
+}
+
+// ─── Team Workload period filter (/v1/pm/dashboard/team-workload) ─────────
+//
+// TeamWorkloadByPeriod is DashboardSummary's teamWorkload section, widened
+// to accept a period instead of always being the current calendar week —
+// see CLAUDE.md for the full requirements writeup. Per-member fields and
+// their period-sensitivity (also documented in CLAUDE.md):
+//   - activeTasks / inProgressTasks / overdueTasks / currentClockIn: always
+//     CURRENT snapshot, never historical — the task explicitly asked for
+//     this ("agar dashboard tetap actionable"): "how much is on this
+//     person's plate right now" doesn't make sense as a stale July number
+//     while looking at a June report.
+//   - completedTasks / hoursLogged / averageHoursPerDay: scoped to the
+//     selected period.
+//   - loadStatus: uses the period's hoursLogged against weekly or monthly
+//     thresholds depending on periodKind (see loadStatusForPeriod).
+func (s *pmService) TeamWorkloadByPeriod(periodType, monthParam string) (model.Row, error) {
+	now := time.Now()
+	start, end, label, periodKind, isOngoing, err := resolvePeriodRange(periodType, monthParam, now)
+	if err != nil {
+		return nil, err
+	}
+
+	members, err := s.Repository.PmMembersForWorkload()
+	if err != nil {
+		members = []model.Row{}
+	}
+	tasks, err := s.Repository.PmPortfolioTasks()
+	if err != nil {
+		tasks = []model.Row{}
+	}
+	activeSessions, err := s.Repository.PmActiveWorkSessions()
+	if err != nil {
+		activeSessions = []model.Row{}
+	}
+	periodSeconds, err := s.Repository.PmWorkloadSecondsByUserForRange(start, end)
+	if err != nil {
+		periodSeconds = []model.Row{}
+	}
+	periodCompleted, err := s.Repository.PmCompletedTasksByUserForRange(start, end)
+	if err != nil {
+		periodCompleted = []model.Row{}
+	}
+
+	tasksByUser := make(map[int64][]model.Row, len(members))
+	for _, t := range tasks {
+		uid, ok := toInt64(t["assigned_to"])
+		if !ok || uid == 0 {
+			continue
+		}
+		tasksByUser[uid] = append(tasksByUser[uid], t)
+	}
+	secondsByUser := make(map[int64]int64, len(periodSeconds))
+	for _, row := range periodSeconds {
+		uid, _ := toInt64(row["user_id"])
+		seconds, _ := toInt64(row["period_seconds"])
+		secondsByUser[uid] = seconds
+	}
+	completedByUser := make(map[int64]int64, len(periodCompleted))
+	for _, row := range periodCompleted {
+		uid, _ := toInt64(row["user_id"])
+		count, _ := toInt64(row["completed_tasks"])
+		completedByUser[uid] = count
+	}
+	activeSessionByUser := make(map[int64]model.Row, len(activeSessions))
+	for _, row := range activeSessions {
+		uid, _ := toInt64(row["user_id"])
+		activeSessionByUser[uid] = row
+	}
+
+	// workdaysElapsed: for a period still in progress (isOngoing), count
+	// Mon-Fri only up to and including today; for a fully-elapsed past
+	// custom_month, count every weekday in the whole month (`end` is
+	// already the exclusive month boundary in that case, so no `now` cap
+	// is needed).
+	workdaysEndExclusive := end
+	if isOngoing {
+		workdaysEndExclusive = now.AddDate(0, 0, 1)
+	}
+	workdaysElapsed := countWeekdays(start, workdaysEndExclusive)
+
+	teamWorkload := make([]model.Row, 0, len(members))
+	for _, member := range members {
+		uid, _ := toInt64(member["id"])
+		userTasks := tasksByUser[uid]
+		var active, inProgress, overdue int64
+		for _, t := range userTasks {
+			statusKey := normalizeTaskStatusKey(str(t["status"]))
+			if statusKey != "done" {
+				active++
+			}
+			if statusKey == "in_progress" {
+				inProgress++
+			}
+			if isOverdueTask(t, now) {
+				overdue++
+			}
+		}
+
+		periodHours := roundTo1(float64(secondsByUser[uid]) / 3600.0)
+		var avgHoursPerDay float64
+		if workdaysElapsed > 0 {
+			avgHoursPerDay = roundTo1(periodHours / float64(workdaysElapsed))
+		}
+
+		var currentClockIn interface{}
+		if session, ok := activeSessionByUser[uid]; ok {
+			taskType := "task"
+			if toBool(session["is_subtask"]) {
+				taskType = "subtask"
+			}
+			spid, _ := toInt64(session["project_id"])
+			currentClockIn = model.Row{
+				"taskId":       session["task_id"],
+				"taskTitle":    session["task_title"],
+				"projectId":    spid,
+				"projectTitle": session["project_title"],
+				"startedAt":    session["started_at"],
+				"taskType":     taskType,
+			}
+		}
+
+		teamWorkload = append(teamWorkload, model.Row{
+			"userId":          uid,
+			"memberName":      member["name"],
+			"jobTitle":        strFromAny(member["job_title"], ""),
+			"activeTasks":     active,
+			"inProgressTasks": inProgress,
+			"completedTasks":  completedByUser[uid],
+			"overdueTasks":    overdue,
+			"hoursLogged":     periodHours,
+			"avgHoursPerDay":  avgHoursPerDay,
+			"currentClockIn":  currentClockIn,
+			"loadStatus":      loadStatusForPeriod(active, overdue, periodHours, periodKind),
+		})
+	}
+
+	return model.Row{
+		"period": model.Row{
+			"type":            periodType,
+			"label":           label,
+			"startDate":       start,
+			"endDate":         end,
+			"workdaysElapsed": workdaysElapsed,
+		},
+		"teamWorkload": teamWorkload,
+	}, nil
+}
+
+// resolvePeriodRange turns a period type (+ optional YYYY-MM month for
+// custom_month) into a concrete [start, end) query range, a display label,
+// whether monthly or weekly loadStatus thresholds apply, and whether the
+// period is still "ongoing" (end == now, so workday-elapsed counting should
+// stop at today) vs a fully-elapsed past (or, edge case, future) month.
+//   - this_week: Monday 00:00 of the current week -> now. Always ongoing.
+//   - this_month: the 1st of the current month 00:00 -> now. Always ongoing.
+//   - custom_month: the 1st of the requested month 00:00 -> either `now`
+//     (ongoing, if the requested month IS the current month) or the 1st of
+//     the FOLLOWING month (not ongoing — a past, or edge-case future, month
+//     is treated as fully elapsed), i.e. the full calendar month.
+func resolvePeriodRange(periodType, monthParam string, now time.Time) (start, end time.Time, label, periodKind string, isOngoing bool, err error) {
+	switch periodType {
+	case "", "this_week":
+		start = startOfWeek(now)
+		end = now
+		label = "This Week"
+		periodKind = "weekly"
+		isOngoing = true
+	case "this_month":
+		start = startOfMonth(now)
+		end = now
+		label = now.Format("January 2006")
+		periodKind = "monthly"
+		isOngoing = true
+	case "custom_month":
+		if strings.TrimSpace(monthParam) == "" {
+			return start, end, "", "", false, fmt.Errorf("%w: month is required for custom_month period (format YYYY-MM)", ErrInvalidWorkloadPeriod)
+		}
+		parsed, perr := time.ParseInLocation("2006-01", monthParam, now.Location())
+		if perr != nil {
+			return start, end, "", "", false, fmt.Errorf("%w: invalid month %q, expected YYYY-MM", ErrInvalidWorkloadPeriod, monthParam)
+		}
+		start = time.Date(parsed.Year(), parsed.Month(), 1, 0, 0, 0, 0, now.Location())
+		nextMonth := start.AddDate(0, 1, 0)
+		if start.Year() == now.Year() && start.Month() == now.Month() {
+			end = now
+			isOngoing = true
+		} else {
+			end = nextMonth
+			isOngoing = false
+		}
+		label = start.Format("January 2006")
+		periodKind = "monthly"
+	default:
+		return start, end, "", "", false, fmt.Errorf("%w: unknown period %q (expected this_week, this_month, or custom_month)", ErrInvalidWorkloadPeriod, periodType)
+	}
+	return start, end, label, periodKind, isOngoing, nil
+}
+
+// startOfWeek returns Monday 00:00 of t's ISO week (Mon-Fri are the only
+// days that ever count as "workdays" in this feature).
+func startOfWeek(t time.Time) time.Time {
+	daysSinceMonday := (int(t.Weekday()) + 6) % 7 // Sunday=0 -> 6, Monday=1 -> 0, ...
+	d := t.AddDate(0, 0, -daysSinceMonday)
+	return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, t.Location())
+}
+
+func startOfMonth(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location())
+}
+
+// countWeekdays counts Mon-Fri calendar days in [startInclusive, endExclusive).
+func countWeekdays(startInclusive, endExclusive time.Time) int {
+	d := time.Date(startInclusive.Year(), startInclusive.Month(), startInclusive.Day(), 0, 0, 0, 0, startInclusive.Location())
+	endDay := time.Date(endExclusive.Year(), endExclusive.Month(), endExclusive.Day(), 0, 0, 0, 0, endExclusive.Location())
+	count := 0
+	for d.Before(endDay) {
+		if wd := d.Weekday(); wd != time.Saturday && wd != time.Sunday {
+			count++
+		}
+		d = d.AddDate(0, 0, 1)
+	}
+	return count
+}
+
+// loadStatusForPeriod is loadStatus's period-aware sibling — same priority
+// order (heaviest signal wins, checked first), but the hours thresholds
+// scale with periodKind ("weekly" thresholds for this_week; "monthly" —
+// roughly 4x — for this_month/custom_month, per the task's explicit rule
+// table). Deliberately a separate function from loadStatus (used by
+// DashboardSummary, always weekly) rather than a shared one with a bypass
+// flag — keeps the always-weekly summary card path simple and unable to
+// accidentally regress if this one changes.
+func loadStatusForPeriod(activeTasks, overdueTasks int64, hoursLogged float64, periodKind string) string {
+	heavyHours, moderateHours := 35.0, 20.0
+	if periodKind == "monthly" {
+		heavyHours, moderateHours = 140.0, 80.0
+	}
+	switch {
+	case activeTasks > 5 || hoursLogged > heavyHours || overdueTasks > 0:
+		return "Berat"
+	case activeTasks >= 3 || hoursLogged >= moderateHours:
+		return "Sedang"
+	default:
+		return "Ringan"
+	}
 }
 
 // planProgressPercent is the "planned progress" side of Portfolio Progress:

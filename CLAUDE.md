@@ -320,6 +320,126 @@ Stage/Health tallies, `attentionNeeded` correctly ranked Blocked-first, no
 active work sessions (empty array, no error), `recentActivity` showing real
 task-activity-log rows (created/status changes/manual work logs).
 
+## Team Workload period filter — `GET /v1/pm/dashboard/team-workload` (2026-07-22)
+
+Follow-up to the dashboard summary endpoint above: `DashboardSummary`'s
+`teamWorkload` is always "this calendar week" (via `PmWeeklySecondsByUser`)
+and can't be repointed at a different period without refetching the whole
+dashboard. This new, separate endpoint gives the Team Workload section its
+own period filter without touching any other section — a dedicated
+endpoint was chosen over an `?workloadPeriod=` query param on
+`/dashboard/summary` specifically so switching period only ever issues one
+small request, not a full-dashboard refetch.
+
+`GET /dashboard/team-workload?period=this_week|this_month|custom_month[&month=YYYY-MM]`
+— `period` defaults to `this_week`; `month` is required (and validated,
+`400` via `service.ErrInvalidWorkloadPeriod` if missing/malformed) only for
+`custom_month`.
+
+```json
+{
+  "period": { "type": "this_month", "label": "July 2026", "startDate": "...", "endDate": "...", "workdaysElapsed": 16 },
+  "teamWorkload": [ { "userId": 41, "memberName": "...", "jobTitle": "...", "activeTasks": 2, "inProgressTasks": 0, "completedTasks": 1, "overdueTasks": 0, "hoursLogged": 0, "avgHoursPerDay": 0, "currentClockIn": null, "loadStatus": "Ringan" } ]
+}
+```
+
+### Which fields are period-scoped vs always-current
+
+Per the explicit requirement ("agar dashboard tetap actionable"):
+- **Always CURRENT, never historical**: `activeTasks`, `inProgressTasks`,
+  `overdueTasks` (all three: `PmPortfolioTasks()`'s raw stored `status`/
+  `deadline`, same as `DashboardSummary`), and `currentClockIn`
+  (`PmActiveWorkSessions()` — a live open session doesn't have a "period",
+  it either exists right now or it doesn't). A June workload report still
+  shows what's on someone's plate *today*, by design.
+- **Scoped to the selected period**: `completedTasks` and `hoursLogged`
+  (and `avgHoursPerDay`, derived from `hoursLogged`).
+
+### Period resolution (`resolvePeriodRange`, `service.go`)
+
+| `period` | `start` | `end` | ongoing? |
+|---|---|---|---|
+| `this_week` | Monday 00:00 of the current ISO week | `now` | always |
+| `this_month` | 1st of the current month 00:00 | `now` | always |
+| `custom_month` (= current month) | 1st of that month 00:00 | `now` | yes |
+| `custom_month` (past or future) | 1st of that month 00:00 | 1st of the *following* month 00:00 (full calendar month) | no |
+
+"Ongoing" controls `workdaysElapsed` (below) and is returned from
+`resolvePeriodRange` as an explicit `isOngoing bool` — deliberately not
+re-derived by comparing `end` to `now` at the call site (fragile,
+`time.Time` equality isn't a safe signal), the resolver just tells the
+caller directly.
+
+### Hours Logged — "the safest option", per the task's own framing
+
+`PmWorkloadSecondsByUserForRange(start, end)`: sums `duration_seconds` for
+`pm_task_time_logs` rows with `ended_at IS NOT NULL` (i.e. **closed**
+sessions only — both finished realtime clock sessions and manual work logs,
+since a manual entry is always inserted already-closed) whose `started_at`
+falls in `[start, end)`. **A still-open (active) session's live elapsed
+time is deliberately NOT added** — unlike `PmWeeklySecondsByUser` (the
+always-"this week" summary card, which DOES fold in the running session for
+a "what's happening right now" feel), a period report needs to be a stable,
+reproducible number. Including live elapsed time would make `hoursLogged`
+silently tick upward every second while someone has the dashboard open,
+which reads as a bug for a report, not a feature. Once the user clocks out,
+that session's real duration lands in the period it was closed... no —
+lands in the period it *started* in (`started_at`-bucketed, matching every
+other time-bucketing convention in this codebase, e.g. `TimesheetSummary`).
+
+### Average Hours / Day — workday counting, never divides by zero
+
+`workdaysElapsed` = count of Mon-Fri calendar days (`countWeekdays`) in the
+period, capped at "up to and including today" when `isOngoing`, or the full
+month when a past `custom_month` (`end` is already the exclusive month
+boundary in that case, so no `now` cap is applied). `avgHoursPerDay =
+hoursLogged / workdaysElapsed`, but **only when `workdaysElapsed > 0`** —
+otherwise `0`. This can only be zero in one real edge case: viewing
+`this_week`/`this_month` on a Saturday/Sunday that falls before the first
+weekday of that period has occurred yet (impossible for a past
+`custom_month`, since a full real month always contains at least one
+weekday). `workdaysElapsed` itself is still reported honestly as `0` in the
+response — only the division is guarded, the underlying data isn't hidden.
+
+### Load Status — weekly vs monthly thresholds
+
+`loadStatusForPeriod(activeTasks, overdueTasks, hoursLogged, periodKind)` —
+a period-aware sibling of the always-weekly `loadStatus` used by
+`DashboardSummary` (kept as two separate functions on purpose: the summary
+card's path stays simple and can't regress if this one changes).
+`periodKind` is `"weekly"` for `this_week`, `"monthly"` for
+`this_month`/`custom_month` (any month-based period uses monthly
+thresholds, including the current month via `custom_month`):
+
+| | Ringan | Sedang | Berat |
+|---|---|---|---|
+| activeTasks | ≤2 | 3-5 | >5 |
+| hoursLogged (weekly) | <20 | 20-35 | >35 |
+| hoursLogged (monthly) | <80 | 80-140 | >140 |
+| overdueTasks | 0 | — | >0 (forces Berat regardless of the above) |
+
+Checked heaviest-first (Berat, then Sedang, else Ringan) so any single
+qualifying condition escalates — e.g. zero active tasks but 150 logged
+hours this month still reports Berat.
+
+### Completed Tasks — best-effort via `status_changed_at`
+
+`PmCompletedTasksByUserForRange`: counts each assignee's tasks with
+`LOWER(status) IN ('done','completed')` whose `status_changed_at` falls in
+`[start, end)` — the same column `MoveProjectTaskByKey`/`UpdateProjectTask`
+already stamp on every transition, no new column added. Best-effort since
+that column only holds the *latest* transition: a task Done→reopened→Done
+again within one window still counts once (correct); a task completed in a
+past period and never touched again correctly stops counting once the
+period moves past it.
+
+Frontend: `PmDashboard/index.jsx` — segmented control (This Week/This
+Month/Custom Month) in the Team Workload card header, native
+`<input type="month">` for Custom Month. Switching period calls only
+`GET /dashboard/team-workload` (confirmed via network trace during manual
+testing — no other section refetches). See the frontend repo's `CLAUDE.md`
+for the UI-side detail.
+
 ## Stage label: 'Fieldwork' renamed to 'In Progress' (2026-07-22)
 
 `taskStageCaseSQL`'s progress-tasks branch now emits `'In Progress'` instead
