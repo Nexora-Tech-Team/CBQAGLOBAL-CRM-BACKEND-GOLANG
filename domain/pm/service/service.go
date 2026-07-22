@@ -51,6 +51,9 @@ type ServiceInterface interface {
 	ClockOutTask(taskID string, userID int64, note *string, actorUserIDRaw interface{}) (model.Row, error)
 	TaskTimeLogs(taskID string, userID int64) (model.Row, error)
 	ActiveTimeLogForUser(userID int64) (model.Row, error)
+	CreateManualTimeLog(taskID string, body map[string]interface{}, actorUserIDRaw interface{}) (model.Row, error)
+	UpdateManualTimeLog(logID int64, body map[string]interface{}, actorUserIDRaw interface{}) (model.Row, error)
+	DeleteManualTimeLog(logID int64, actorUserIDRaw interface{}) error
 
 	CrmProjectMembers(crmProjectID int64) ([]model.Row, error)
 	AddCrmProjectMember(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error)
@@ -474,6 +477,14 @@ func (s *pmService) attachEffectiveProgress(crmProjectID int64, row model.Row) (
 	if p, ok := progress[str(row["id"])]; ok {
 		row["progress_pct"] = p.Progress
 		row["has_active_subtasks"] = p.IsParent
+		if p.IsParent {
+			row["status"] = p.Status
+			row["status_key"] = p.Status
+			if meta, ok := statusMeta[p.Status]; ok {
+				row["status_title"] = meta.Title
+				row["status_color"] = meta.Color
+			}
+		}
 	}
 	return row, nil
 }
@@ -649,8 +660,13 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 	// Resolve the status this task will have AFTER this update (its new
 	// value if provided, else whatever it already had) — needed even when
 	// only progressPct changes, since the leaf progress rule depends on it.
+	// A parent task's status is always derived from its children on read
+	// (see deriveParentStatus/computeTaskProgress) exactly like its
+	// progress — a manual status change aimed at one is silently dropped,
+	// same reasoning as the progress guard below (the request may
+	// legitimately be touching unrelated fields in the same call).
 	newStatusKey := str(before["status"])
-	if statusRaw, ok := body["status"].(string); ok && strings.TrimSpace(statusRaw) != "" {
+	if statusRaw, ok := body["status"].(string); ok && strings.TrimSpace(statusRaw) != "" && !isParent {
 		statusID, err := s.Repository.ResolveStatusID(nil, statusRaw)
 		if err != nil {
 			return nil, err
@@ -708,21 +724,24 @@ func (s *pmService) MoveProjectTaskByKey(id, statusKey string, actorUserIDRaw in
 	if err != nil {
 		return nil, err
 	}
-	if err := s.Repository.MoveProjectTaskByKey(id, statusKey); err != nil {
-		return nil, err
-	}
 
-	// Kanban drag never carries a manual progress value — apply the same
-	// leaf status rule table as everywhere else (to_do->0, in_progress->10
-	// only if it was 0, in_review->floor 90, done->100, blocked->unchanged).
-	// Parent tasks are skipped: their progress is always derived from
-	// children on read, dragging one on the board (if the UI even allows
-	// it) must not stomp a stored value nobody reads.
+	// A parent task's status AND progress are always derived from its
+	// children on read (deriveParentStatus / leafProgressForStatus) —
+	// dragging one on the Kanban board (the UI should prevent this, but the
+	// backend is the actual source of truth) is a no-op on both stored
+	// columns rather than an error, consistent with how UpdateProjectTask
+	// silently drops a manual progress/status aimed at a parent.
 	childCount, err := s.Repository.ActiveChildTaskCount(id)
 	if err != nil {
 		return nil, err
 	}
 	if childCount == 0 {
+		if err := s.Repository.MoveProjectTaskByKey(id, statusKey); err != nil {
+			return nil, err
+		}
+		// Kanban drag never carries a manual progress value — apply the same
+		// leaf status rule table as everywhere else (to_do->0, in_progress->10
+		// only if it was 0, in_review->floor 90, done->100, blocked->unchanged).
 		newProgress := leafProgressForStatus(statusKey, progressPctFromRow(before["progress_pct"]), nil)
 		if err := s.Repository.UpdateProjectTask(id, map[string]interface{}{"progress_pct": newProgress}); err != nil {
 			return nil, err
@@ -897,6 +916,27 @@ func (s *pmService) TaskTimeLogs(taskID string, userID int64) (model.Row, error)
 // enriched with the task's title/project so the frontend can render a
 // friendly "Clocked in on another task: <title>" message without a second
 // lookup.
+// elapsedSecondsFrom computes how long ago a DB-scanned timestamp column
+// (time.Time via database/sql) was, floored at 0 so clock skew between the
+// app server and DB never reports a negative running timer.
+func elapsedSecondsFrom(v interface{}) int64 {
+	t, ok := v.(time.Time)
+	if !ok {
+		return 0
+	}
+	elapsed := int64(time.Since(t).Seconds())
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
+}
+
+// ActiveTimeLogForUser answers "is this user clocked in anywhere right now"
+// as a flat, frontend-ready shape — {active:false} or {active:true, taskId,
+// taskTitle, taskType (task/subtask), parentTaskId/Title, projectId/Title,
+// startedAt, elapsedSeconds} — so the drawer/topbar can render "Clocked in
+// on another task: X" (and, for a subtask, name its parent) without a
+// second round trip.
 func (s *pmService) ActiveTimeLogForUser(userID int64) (model.Row, error) {
 	if userID == 0 {
 		return nil, fmt.Errorf("userId is required")
@@ -906,13 +946,249 @@ func (s *pmService) ActiveTimeLogForUser(userID int64) (model.Row, error) {
 		return nil, err
 	}
 	if active == nil {
-		return model.Row{"activeLog": nil}, nil
+		return model.Row{"active": false}, nil
 	}
-	if task, taskErr := s.Repository.ProjectTaskByID(str(active["task_id"])); taskErr == nil {
-		active["task_title"] = task["title"]
-		active["crm_project_id"] = task["crm_project_id"]
+
+	taskID := str(active["task_id"])
+	result := model.Row{
+		"active":         true,
+		"taskId":         taskID,
+		"startedAt":      active["started_at"],
+		"elapsedSeconds": elapsedSecondsFrom(active["started_at"]),
 	}
-	return model.Row{"activeLog": active}, nil
+
+	task, err := s.Repository.ProjectTaskByID(taskID)
+	if err != nil {
+		// Session row outlived its task somehow (shouldn't happen — tasks
+		// are soft-deleted, never hard-deleted) — still report the bare
+		// active session instead of erroring the whole check.
+		return result, nil
+	}
+	result["taskTitle"] = task["title"]
+
+	if parentTaskID := str(task["parent_task_id"]); parentTaskID != "" {
+		result["taskType"] = "subtask"
+		result["parentTaskId"] = parentTaskID
+		if parent, perr := s.Repository.ProjectTaskByID(parentTaskID); perr == nil {
+			result["parentTaskTitle"] = parent["title"]
+		}
+	} else {
+		result["taskType"] = "task"
+	}
+
+	crmProjectID := projectIDFromRow(task)
+	result["projectId"] = crmProjectID
+	if proj, perr := s.Repository.CrmProjectByID(crmProjectID); perr == nil {
+		result["projectTitle"] = proj["title"]
+	}
+
+	return result, nil
+}
+
+// timeFromRow reads a DB-scanned timestamp column as *time.Time — used when
+// falling back to an existing log's stored started_at/ended_at during a
+// partial manual-log edit.
+func timeFromRow(v interface{}) *time.Time {
+	t, ok := v.(time.Time)
+	if !ok {
+		return nil
+	}
+	return &t
+}
+
+// resolveManualLogActor is the shared "who's actually performing this
+// write, and what's their display name" resolution for all three manual-log
+// mutations — falls back to resolving userID's own name when no distinct
+// actor name comes back (e.g. actorUserId wasn't sent), same pattern
+// ClockInTask/ClockOutTask already use.
+func (s *pmService) resolveManualLogActor(actorUserIDRaw interface{}, fallbackUserID int64) (*int64, string) {
+	actorUserID, actorName := s.resolveActor(actorSource(map[string]interface{}{"actorUserId": actorUserIDRaw}, ""))
+	if actorUserID == nil {
+		actorUserID = &fallbackUserID
+	}
+	if actorName == "" || actorName == "System" {
+		if name, err := s.Repository.ResolveUserName(*actorUserID); err == nil && name != "" {
+			actorName = name
+		}
+	}
+	return actorUserID, actorName
+}
+
+// CreateManualTimeLog logs an already-closed session for the case the user
+// forgot to clock in/out — same table as ClockIn/ClockOut (source='manual'
+// instead of 'realtime'), but no "one active session" constraint applies
+// (that's specific to *open* sessions); it's checked instead for double-
+// booking against ANY of the user's existing sessions, open or closed, via
+// ManualLogOverlapExists.
+func (s *pmService) CreateManualTimeLog(taskID string, body map[string]interface{}, actorUserIDRaw interface{}) (model.Row, error) {
+	if !validUUID(taskID) {
+		return nil, fmt.Errorf("invalid task id")
+	}
+	userID := int64FromAny(body["userId"], 0)
+	if userID == 0 {
+		return nil, fmt.Errorf("userId is required")
+	}
+	note := strings.TrimSpace(strFromAny(body["note"], ""))
+	if note == "" {
+		return nil, fmt.Errorf("note is required for a manual log")
+	}
+	startedAt := parseDateTime(strPtrFromAny(body["startedAt"]))
+	endedAt := parseDateTime(strPtrFromAny(body["endedAt"]))
+	if startedAt == nil || endedAt == nil {
+		return nil, fmt.Errorf("startedAt and endedAt are required")
+	}
+	if !startedAt.Before(*endedAt) {
+		return nil, fmt.Errorf("startedAt must be before endedAt")
+	}
+
+	overlap, err := s.Repository.ManualLogOverlapExists(userID, *startedAt, *endedAt, nil)
+	if err != nil {
+		return nil, err
+	}
+	if overlap {
+		return nil, fmt.Errorf("this time range overlaps an existing log for this user")
+	}
+
+	task, err := s.Repository.ProjectTaskByID(taskID)
+	if err != nil {
+		return nil, err
+	}
+	projectID := projectIDFromRow(task)
+	duration := int64(endedAt.Sub(*startedAt).Seconds())
+
+	actorUserID, actorName := s.resolveManualLogActor(actorUserIDRaw, userID)
+	row, err := s.Repository.InsertManualTimeLog(map[string]interface{}{
+		"task_id":          taskID,
+		"project_id":       projectID,
+		"user_id":          userID,
+		"started_at":       *startedAt,
+		"ended_at":         *endedAt,
+		"duration_seconds": duration,
+		"note":             note,
+		"source":           "manual",
+		"created_by":       *actorUserID,
+		"updated_by":       *actorUserID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	desc := fmt.Sprintf("%s added a manual work log (%s)", actorName, formatDurationShort(duration))
+	if *actorUserID != userID {
+		if ownerName, nerr := s.Repository.ResolveUserName(userID); nerr == nil && ownerName != "" {
+			desc = fmt.Sprintf("%s added a manual work log for %s (%s)", actorName, ownerName, formatDurationShort(duration))
+		}
+	}
+	s.logTaskActivity(taskID, projectID, actorUserID, actorName, "manual_log_created", "", nil, nil, desc)
+
+	return row, nil
+}
+
+// UpdateManualTimeLog edits an existing manual log's time range/note/owner.
+// Only source='manual' rows are editable — a real-time session's
+// started_at/ended_at are a factual record of when the user actually
+// clocked in/out, not something to hand-edit after the fact.
+func (s *pmService) UpdateManualTimeLog(logID int64, body map[string]interface{}, actorUserIDRaw interface{}) (model.Row, error) {
+	before, err := s.Repository.TimeLogByID(logID)
+	if err != nil {
+		return nil, err
+	}
+	if str(before["source"]) != "manual" {
+		return nil, fmt.Errorf("only manual logs can be edited")
+	}
+
+	startedAt := parseDateTime(strPtrFromAny(body["startedAt"]))
+	endedAt := parseDateTime(strPtrFromAny(body["endedAt"]))
+	effectiveStart := startedAt
+	if effectiveStart == nil {
+		effectiveStart = timeFromRow(before["started_at"])
+	}
+	effectiveEnd := endedAt
+	if effectiveEnd == nil {
+		effectiveEnd = timeFromRow(before["ended_at"])
+	}
+	if effectiveStart == nil || effectiveEnd == nil {
+		return nil, fmt.Errorf("startedAt and endedAt are required")
+	}
+	if !effectiveStart.Before(*effectiveEnd) {
+		return nil, fmt.Errorf("startedAt must be before endedAt")
+	}
+
+	userID := int64FromAny(body["userId"], 0)
+	if userID == 0 {
+		userID, _ = toInt64(before["user_id"])
+	}
+
+	overlap, err := s.Repository.ManualLogOverlapExists(userID, *effectiveStart, *effectiveEnd, &logID)
+	if err != nil {
+		return nil, err
+	}
+	if overlap {
+		return nil, fmt.Errorf("this time range overlaps an existing log for this user")
+	}
+
+	fields := map[string]interface{}{}
+	if startedAt != nil {
+		fields["started_at"] = *startedAt
+	}
+	if endedAt != nil {
+		fields["ended_at"] = *endedAt
+	}
+	if startedAt != nil || endedAt != nil {
+		fields["duration_seconds"] = int64(effectiveEnd.Sub(*effectiveStart).Seconds())
+	}
+	if _, ok := body["userId"]; ok && userID > 0 {
+		fields["user_id"] = userID
+	}
+	if noteRaw, ok := body["note"]; ok {
+		note := strings.TrimSpace(strFromAny(noteRaw, ""))
+		if note == "" {
+			return nil, fmt.Errorf("note is required for a manual log")
+		}
+		fields["note"] = note
+	}
+
+	actorUserID, actorName := s.resolveManualLogActor(actorUserIDRaw, userID)
+	fields["updated_by"] = *actorUserID
+
+	if len(fields) > 0 {
+		if err := s.Repository.UpdateTimeLog(logID, fields); err != nil {
+			return nil, err
+		}
+	}
+	after, err := s.Repository.TimeLogByID(logID)
+	if err != nil {
+		return nil, err
+	}
+
+	taskID := str(after["task_id"])
+	projectID := projectIDFromRow(after)
+	s.logTaskActivity(taskID, projectID, actorUserID, actorName, "manual_log_updated", "", nil, nil,
+		fmt.Sprintf("%s updated a manual work log", actorName))
+
+	return after, nil
+}
+
+// DeleteManualTimeLog soft-deletes a manual log. Real-time (clock in/out)
+// sessions have no delete endpoint wired to them — this only ever operates
+// on source='manual' rows.
+func (s *pmService) DeleteManualTimeLog(logID int64, actorUserIDRaw interface{}) error {
+	before, err := s.Repository.TimeLogByID(logID)
+	if err != nil {
+		return err
+	}
+	if str(before["source"]) != "manual" {
+		return fmt.Errorf("only manual logs can be deleted")
+	}
+	if err := s.Repository.DeleteTimeLog(logID); err != nil {
+		return err
+	}
+
+	ownerID, _ := toInt64(before["user_id"])
+	actorUserID, actorName := s.resolveManualLogActor(actorUserIDRaw, ownerID)
+	s.logTaskActivity(str(before["task_id"]), projectIDFromRow(before), actorUserID, actorName, "manual_log_deleted", "", nil, nil,
+		fmt.Sprintf("%s deleted a manual work log", actorName))
+	return nil
 }
 
 // describeAlreadyClockedIn turns the bare ErrAlreadyClockedIn into a message
@@ -1174,12 +1450,70 @@ func toInt64(v interface{}) (int64, bool) {
 // CrmProjects, TasksByCrmProject, and the task write paths (CreateTask/
 // UpdateTask/MoveTaskByKey below) for where this plugs in.
 
-// taskProgress holds one task's derived effective progress plus whether it
-// has any active direct subtasks. A task with subtasks is a "parent": its
-// progress is always the average of its children, never a manual value.
+// taskProgress holds one task's derived effective progress/status plus
+// whether it has any active direct subtasks. A task with subtasks is a
+// "parent": its progress AND status are always derived from its children,
+// never a manual value — see leafProgressForStatus (progress) and
+// deriveParentStatus (status) for the two rule tables.
 type taskProgress struct {
 	Progress int64
+	Status   string // normalized key: to_do/in_progress/in_review/blocked/done
 	IsParent bool
+}
+
+// normalizeTaskStatusKey lowercases/trims a raw status value and folds
+// 'completed' into 'done' — the one place both leafProgressForStatus and
+// deriveParentStatus agree on what a status string actually means.
+func normalizeTaskStatusKey(raw string) string {
+	key := strings.ToLower(strings.TrimSpace(raw))
+	if key == "completed" {
+		return "done"
+	}
+	if key == "" {
+		return "to_do"
+	}
+	return key
+}
+
+// deriveParentStatus is the status equivalent of leafProgressForStatus's
+// progress rule, applied to a parent's direct children (already resolved to
+// their own EFFECTIVE status — a nested parent contributes its own derived
+// status, not its raw stored one). Priority (highest first): Blocked >
+// In Review > In Progress > Done > To Do. A child counts toward "Done" if
+// its own status is done OR its effective progress is 100 (matches the
+// leaf rule where in_review can already sit at 100) — Done only fires once
+// EVERY child qualifies that way, never partially.
+func deriveParentStatus(children []taskProgress) string {
+	total := len(children)
+	if total == 0 {
+		return "to_do"
+	}
+	var blocked, review, inProgress, complete int
+	for _, c := range children {
+		switch c.Status {
+		case "blocked":
+			blocked++
+		case "in_review":
+			review++
+		case "in_progress":
+			inProgress++
+		}
+		if c.Status == "done" || c.Progress >= 100 {
+			complete++
+		}
+	}
+	switch {
+	case blocked > 0:
+		return "blocked"
+	case review > 0:
+		return "in_review"
+	case inProgress > 0:
+		return "in_progress"
+	case complete == total:
+		return "done"
+	default:
+		return "to_do"
+	}
 }
 
 // projectIDFromRow reads crm_project_id out of a DB-scanned model.Row —
@@ -1253,15 +1587,18 @@ func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress 
 	}
 }
 
-// computeTaskProgress derives every task's EFFECTIVE progress bottom-up:
-// leaves come from leafProgressForStatus; a task with active children is the
-// rounded average of its children's own effective progress, computed
-// recursively so nested subtasks fold correctly however deep the tree goes.
-// `tasks` should be every active task sharing a scope (one project, or all
-// projects at once for the list endpoint) — this is one pass over an
-// already-fetched slice, never an extra query per task. A malformed/cyclic
-// parent_task_id chain (never seen in practice) falls back to that task's
-// stored value instead of recursing forever.
+// computeTaskProgress derives every task's EFFECTIVE progress AND status
+// bottom-up: leaves come from leafProgressForStatus (progress) and their own
+// stored status (normalized); a task with active children gets the rounded
+// average of its children's own effective progress (leafProgressForStatus's
+// "recursive" case) and deriveParentStatus's priority rule over its
+// children's own effective status — computed recursively so nested subtasks
+// fold correctly however deep the tree goes. `tasks` should be every active
+// task sharing a scope (one project, or all projects at once for the list
+// endpoint) — this is one pass over an already-fetched slice, never an extra
+// query per task. A malformed/cyclic parent_task_id chain (never seen in
+// practice) falls back to that task's own stored progress/status instead of
+// recursing forever.
 func computeTaskProgress(tasks []model.Row) map[string]taskProgress {
 	childrenOf := make(map[string][]string, len(tasks))
 	byID := make(map[string]model.Row, len(tasks))
@@ -1276,34 +1613,42 @@ func computeTaskProgress(tasks []model.Row) map[string]taskProgress {
 	result := make(map[string]taskProgress, len(tasks))
 	visiting := make(map[string]bool, len(tasks))
 
-	var resolve func(id string) int64
-	resolve = func(id string) int64 {
+	var resolve func(id string) taskProgress
+	resolve = func(id string) taskProgress {
 		if r, ok := result[id]; ok {
-			return r.Progress
+			return r
 		}
 		t, known := byID[id]
 		if !known {
-			return 0
+			return taskProgress{Status: "to_do"}
 		}
 		if visiting[id] {
-			return progressPctFromRow(t["progress_pct"])
+			return taskProgress{
+				Progress: progressPctFromRow(t["progress_pct"]),
+				Status:   normalizeTaskStatusKey(str(t["status"])),
+			}
 		}
 		visiting[id] = true
 		kids := childrenOf[id]
 		if len(kids) == 0 {
 			p := leafProgressForStatus(str(t["status"]), progressPctFromRow(t["progress_pct"]), nil)
-			result[id] = taskProgress{Progress: p, IsParent: false}
+			tp := taskProgress{Progress: p, Status: normalizeTaskStatusKey(str(t["status"])), IsParent: false}
+			result[id] = tp
 			visiting[id] = false
-			return p
+			return tp
 		}
 		var sum int64
+		children := make([]taskProgress, 0, len(kids))
 		for _, kid := range kids {
-			sum += resolve(kid)
+			c := resolve(kid)
+			sum += c.Progress
+			children = append(children, c)
 		}
 		avg := (sum + int64(len(kids))/2) / int64(len(kids)) // round-half-up
-		result[id] = taskProgress{Progress: avg, IsParent: true}
+		tp := taskProgress{Progress: avg, Status: deriveParentStatus(children), IsParent: true}
+		result[id] = tp
 		visiting[id] = false
-		return avg
+		return tp
 	}
 
 	for id := range byID {
@@ -1312,11 +1657,26 @@ func computeTaskProgress(tasks []model.Row) map[string]taskProgress {
 	return result
 }
 
-// applyTaskProgress overrides tasks' progress_pct in place with their
-// computed effective value and tags each with has_active_subtasks (so the
+// statusMeta mirrors the frontend's KANBAN_COLS (title-cased label per
+// status key) so a parent task's overridden status carries a correct
+// display title even though it never went through the pm_task_statuses
+// join that set the ORIGINAL status_title/status_color on the row.
+var statusMeta = map[string]struct{ Title, Color string }{
+	"to_do":       {"To Do", "#F9A52D"},
+	"in_progress": {"In progress", "#1672B9"},
+	"in_review":   {"In Review", "#6f42c1"},
+	"blocked":     {"Blocked", "#D63939"},
+	"done":        {"Done", "#00A679"},
+}
+
+// applyTaskProgress overrides tasks' progress_pct/status in place with their
+// computed effective values and tags each with has_active_subtasks (so the
 // frontend can disable manual editing for parent tasks), then returns the
 // progress map — also used by callers to derive the owning project's
-// overall progress via projectProgressFromTasks.
+// overall progress via projectProgressFromTasks. A parent's status_title/
+// status_color are overridden alongside status/status_key so the frontend's
+// badge (which prefers status_title when present) never shows a stale label
+// next to the new derived status.
 func applyTaskProgress(tasks []model.Row) map[string]taskProgress {
 	progress := computeTaskProgress(tasks)
 	for _, t := range tasks {
@@ -1324,6 +1684,14 @@ func applyTaskProgress(tasks []model.Row) map[string]taskProgress {
 		p := progress[id]
 		t["progress_pct"] = p.Progress
 		t["has_active_subtasks"] = p.IsParent
+		if p.IsParent {
+			t["status"] = p.Status
+			t["status_key"] = p.Status
+			if meta, ok := statusMeta[p.Status]; ok {
+				t["status_title"] = meta.Title
+				t["status_color"] = meta.Color
+			}
+		}
 	}
 	return progress
 }

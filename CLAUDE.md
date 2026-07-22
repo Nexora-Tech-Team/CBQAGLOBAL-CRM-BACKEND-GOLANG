@@ -177,3 +177,76 @@ confirmed-successful deploy, check which Go backend host the frontend is
 actually calling (Network tab / build's baked-in `apiPm` baseURL) before
 debugging the backend further — both hosts respond 200 on the same route
 shapes, so this kind of cross-wiring is easy to miss.
+
+## Work Timer (clock in/out) + Manual Work Log (2026-07-22)
+
+`pm_task_time_logs` (migration 013, `source`/`created_by`/`updated_by` added
+in 014) backs both real-time clock sessions and manually-entered ones — see
+`timeLogSelectSQL` in `repository.go` for the single shared read shape.
+
+- **Real-time**: `POST /tasks/:id/clock-in` / `clock-out`. A user may have
+  exactly one OPEN session (`ended_at IS NULL`) at a time, across ALL tasks —
+  enforced by a UNIQUE partial index (`uq_pm_task_time_logs_one_active_per_user`),
+  not just the service-layer check-then-insert (which only exists to turn a
+  race into a clean `ErrAlreadyClockedIn` 409 instead of a raw constraint
+  error). `GET /time-logs/active?userId=` answers "is this user clocked in
+  anywhere" as a flat shape (`{active:false}` or `{active, taskId, taskTitle,
+  taskType: "task"|"subtask", parentTaskId, parentTaskTitle, projectId,
+  projectTitle, startedAt, elapsedSeconds}`) — enriched with parent/project
+  titles in one call so the frontend never needs a second lookup just to
+  render "Clocked in on another task: X".
+- **Manual**: `POST /tasks/:id/time-logs/manual` (body: `userId, startedAt,
+  endedAt, note` — note is mandatory, `startedAt < endedAt` enforced), `PATCH
+  /time-logs/:id`, `DELETE /time-logs/:id` — the latter two only operate on
+  `source = 'manual'` rows (a real-time session's timestamps are a factual
+  record, not something to hand-edit). `ManualLogOverlapExists` rejects a
+  manual entry that overlaps ANY of the user's existing sessions — closed
+  ones by their stored `ended_at`, an open (active clock-in) one treated as
+  extending to `'infinity'` — via a single `tsrange(...) && tsrange(...)`
+  query, so a manual entry can never silently double-book time already being
+  tracked live.
+- **Known gap, deliberate**: the spec's "regular users can only log their own
+  time; Admin/PM can log for others" isn't enforced server-side — this PM API
+  group has no auth at all yet (see the top of this file), so there's no
+  reliable role signal to check against here. `created_by`/`updated_by` do
+  still record who actually performed the write (vs `user_id`, who the log
+  is *for*), and the activity-log description names both when they differ.
+
+## Parent task status — now derived, same pattern as progress (2026-07-22)
+
+`computeTaskProgress`'s `taskProgress` struct gained a `Status` field
+alongside `Progress`. A parent's status is `deriveParentStatus` over its
+children's own *effective* status (recursive — a nested parent contributes
+its derived status, not its raw stored one): priority Blocked > In Review >
+In Progress > Done > To Do, where "Done" only fires once *every* child has
+status `done` or effective progress 100 — never partially. `applyTaskProgress`
+overrides a parent row's `status`/`status_key`/`status_title`/`status_color`
+in place (the title/color come from a small `statusMeta` map mirroring the
+frontend's `KANBAN_COLS`, since the row never went through the real
+`pm_task_statuses` join for this derived value) — same "always compute at
+read time, never trust the stored column" architecture as progress.
+
+`UpdateProjectTask` and `MoveProjectTaskByKey` (Kanban drag) both now guard
+the status write the same way they already guarded progress: a manual
+status change aimed at a parent task is silently dropped (update) or turns
+the whole drag into a no-op on both stored columns (move), never an error —
+the frontend should prevent dragging a parent card in the first place, but
+the backend is the actual source of truth.
+
+**Known limitation, deliberate**: Stage (`taskStageCaseSQL`) still counts
+every active task by its *raw stored* `status` column, including parent
+rows — it does not read through this new derivation. A parent whose stored
+status has gone stale relative to its children could very slightly skew
+Stage's task-status counts. Not fixed here: doing this correctly in SQL
+would need the same bottom-up recursion `computeTaskProgress` does in Go,
+which is a bigger change than this task's scope (renaming the Stage label,
+not re-deriving its inputs). Flagging for whoever touches Stage next.
+
+## Stage label: 'Fieldwork' renamed to 'In Progress' (2026-07-22)
+
+`taskStageCaseSQL`'s progress-tasks branch now emits `'In Progress'` instead
+of `'Fieldwork'` — same priority order (Blocked > Completed > Review > In
+Progress > Planning), same trigger condition, label only. See the frontend
+repo's `CLAUDE.md` for the matching `PROJECT_STAGES`/`normalizeStageLabel`
+change (the latter rewrites any lingering `'Fieldwork'` value read-time, so
+a stale cached response never surfaces the retired label).

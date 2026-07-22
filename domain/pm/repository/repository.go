@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -76,6 +77,11 @@ type RepositoryInterface interface {
 	ClockOut(taskID string, userID int64, note *string) (model.Row, error)
 	TimeLogsByTask(taskID string) ([]model.Row, error)
 	ActiveTimeLogForUser(userID int64) (model.Row, error)
+	TimeLogByID(id int64) (model.Row, error)
+	ManualLogOverlapExists(userID int64, startedAt, endedAt time.Time, excludeID *int64) (bool, error)
+	InsertManualTimeLog(fields map[string]interface{}) (model.Row, error)
+	UpdateTimeLog(id int64, fields map[string]interface{}) error
+	DeleteTimeLog(id int64) error
 
 	// Task activity log (pm_task_activity_logs) — audit trail for the Task
 	// Detail drawer's "Activity" section.
@@ -533,17 +539,21 @@ const taskStageJoinSQL = `
 		) task_stage ON task_stage.crm_project_id = p.id`
 
 // taskStageCaseSQL derives Stage from the joined task_stage counts above.
-// Priority (highest first): Blocked > Completed > Review > Fieldwork > Planning.
+// Priority (highest first): Blocked > Completed > Review > In Progress > Planning.
 // Completed only fires once ALL active tasks are done (and at least one exists);
 // a project with zero active tasks is always Planning, regardless of any other
 // signal. This is the single source of truth for Stage — never set manually.
+// 'In Progress' was previously labeled 'Fieldwork' (renamed 2026-07-22 for a
+// more generic label that reads sensibly outside audit-specific projects) —
+// see CLAUDE.md for the full rename note, including the frontend normalizer
+// that maps any lingering old value for backward compatibility.
 const taskStageCaseSQL = `
 		  CASE
 		    WHEN COALESCE(task_stage.total_tasks, 0) = 0 THEN 'Planning'
 		    WHEN task_stage.blocked_tasks > 0 THEN 'Blocked'
 		    WHEN task_stage.done_tasks = task_stage.total_tasks THEN 'Completed'
 		    WHEN task_stage.review_tasks > 0 THEN 'Review'
-		    WHEN task_stage.progress_tasks > 0 THEN 'Fieldwork'
+		    WHEN task_stage.progress_tasks > 0 THEN 'In Progress'
 		    ELSE 'Planning'
 		  END AS stage`
 
@@ -800,6 +810,7 @@ func (r *repository) ActiveChildTaskCount(parentTaskID string) (int64, error) {
 const timeLogSelectSQL = `
 	SELECT tl.id, tl.task_id::text AS task_id, tl.project_id, tl.user_id,
 	       tl.started_at, tl.ended_at, tl.duration_seconds, tl.note,
+	       tl.source, tl.created_by, tl.updated_by,
 	       tl.created_at, tl.updated_at,
 	       NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS user_name
 	FROM pm_task_time_logs tl
@@ -827,10 +838,10 @@ func (r *repository) ClockIn(taskID string, userID int64, projectID *int64) (mod
 
 		var id int64
 		if err := tx.Raw(`
-			INSERT INTO pm_task_time_logs (task_id, project_id, user_id, started_at, created_at, updated_at)
-			VALUES (?, ?, ?, NOW(), NOW(), NOW())
+			INSERT INTO pm_task_time_logs (task_id, project_id, user_id, started_at, source, created_by, updated_by, created_at, updated_at)
+			VALUES (?, ?, ?, NOW(), 'realtime', ?, ?, NOW(), NOW())
 			RETURNING id
-		`, taskID, projectID, userID).Scan(&id).Error; err != nil {
+		`, taskID, projectID, userID, userID, userID).Scan(&id).Error; err != nil {
 			return err
 		}
 
@@ -917,6 +928,78 @@ func (r *repository) ActiveTimeLogForUser(userID int64) (model.Row, error) {
 		return nil, nil
 	}
 	return rows[0], nil
+}
+
+// TimeLogByID fetches a single (non-deleted) time log row — used by the
+// manual-log edit/delete paths to load the "before" state for a permission
+// check and an activity-log diff.
+func (r *repository) TimeLogByID(id int64) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(timeLogSelectSQL+` WHERE tl.id = ? AND tl.deleted_at IS NULL`, id).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, errors.New("time log not found")
+	}
+	return rows[0], nil
+}
+
+// ManualLogOverlapExists reports whether [startedAt, endedAt] would overlap
+// any of userID's existing (non-deleted) sessions — a closed session uses
+// its own stored ended_at; an open (active clock-in) session is treated as
+// extending to infinity, so a manual entry can never silently double-book
+// time that's already being tracked live. excludeID lets an edit ignore its
+// own row when re-checking a changed time range.
+func (r *repository) ManualLogOverlapExists(userID int64, startedAt, endedAt time.Time, excludeID *int64) (bool, error) {
+	var count int64
+	err := r.DB.Raw(`
+		SELECT COUNT(*) FROM pm_task_time_logs
+		WHERE user_id = ?
+		  AND deleted_at IS NULL
+		  AND (?::bigint IS NULL OR id != ?)
+		  AND tsrange(started_at, COALESCE(ended_at, 'infinity'::timestamp), '[]')
+		      && tsrange(?::timestamp, ?::timestamp, '[]')
+	`, userID, excludeID, excludeID, startedAt, endedAt).Scan(&count).Error
+	return count > 0, err
+}
+
+// InsertManualTimeLog creates a closed (already has ended_at/duration_seconds)
+// manual session and returns its full row. Unlike ClockIn/ClockOut, this
+// never runs inside a transaction with a lock check — the overlap check
+// (ManualLogOverlapExists) already ran in the service layer immediately
+// before this call; a manual entry has no "only one at a time" constraint
+// to protect (that's specific to *active* clock-ins), so the extra
+// transaction wrapping ClockIn/ClockOut needs would just be overhead here.
+func (r *repository) InsertManualTimeLog(fields map[string]interface{}) (model.Row, error) {
+	columns, placeholders, values := buildInsert(fields)
+	var id int64
+	sql := fmt.Sprintf(`INSERT INTO pm_task_time_logs (%s) VALUES (%s) RETURNING id`, columns, placeholders)
+	if err := r.DB.Raw(sql, values...).Scan(&id).Error; err != nil {
+		return nil, err
+	}
+	return r.TimeLogByID(id)
+}
+
+// UpdateTimeLog patches an existing (non-deleted) time log — used by the
+// manual-log edit endpoint. Recomputes nothing itself; the service layer
+// passes whatever fields (including a freshly recomputed duration_seconds,
+// if the time range changed) need to change.
+func (r *repository) UpdateTimeLog(id int64, fields map[string]interface{}) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	set, values := buildUpdate(fields)
+	values = append(values, id)
+	sql := fmt.Sprintf(`UPDATE pm_task_time_logs SET %s, updated_at = NOW() WHERE id = ? AND deleted_at IS NULL`, set)
+	return r.DB.Exec(sql, values...).Error
+}
+
+// DeleteTimeLog soft-deletes a time log — same convention as
+// DeleteProjectTask, so history remains queryable/auditable even after
+// "deletion".
+func (r *repository) DeleteTimeLog(id int64) error {
+	return r.DB.Exec(`UPDATE pm_task_time_logs SET deleted_at = NOW(), updated_at = NOW() WHERE id = ?`, id).Error
 }
 
 // InsertTaskActivityLog appends one audit-trail row. Never deleted alongside

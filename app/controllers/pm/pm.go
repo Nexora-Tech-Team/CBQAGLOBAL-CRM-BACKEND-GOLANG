@@ -521,6 +521,57 @@ func (pc *pmController) ActiveTimeLog(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, data)
 }
 
+// CreateManualTimeLog handles POST /tasks/:id/time-logs/manual — body:
+// { userId, startedAt, endedAt, note, actorUserId? }.
+func (pc *pmController) CreateManualTimeLog(ctx *gin.Context) {
+	taskID := ctx.Param("id")
+	var body map[string]interface{}
+	if err := ctx.ShouldBindJSON(&body); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, err := pc.Service.CreateManualTimeLog(taskID, body, body["actorUserId"])
+	if err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+// UpdateTimeLog handles PATCH /time-logs/:id — body: any of
+// { userId, startedAt, endedAt, note, actorUserId? }, all optional.
+func (pc *pmController) UpdateTimeLog(ctx *gin.Context) {
+	id, ok := parseIDParam(ctx, "id")
+	if !ok {
+		return
+	}
+	var body map[string]interface{}
+	if err := ctx.ShouldBindJSON(&body); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, err := pc.Service.UpdateManualTimeLog(id, body, body["actorUserId"])
+	if err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, data)
+}
+
+// DeleteTimeLog handles DELETE /time-logs/:id?actorUserId=... (DELETE
+// requests carry no body from the frontend, same convention as DeleteTask).
+func (pc *pmController) DeleteTimeLog(ctx *gin.Context) {
+	id, ok := parseIDParam(ctx, "id")
+	if !ok {
+		return
+	}
+	if err := pc.Service.DeleteManualTimeLog(id, ctx.Query("actorUserId")); err != nil {
+		response.Error(ctx, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, nil)
+}
+
 func parseInt64QueryRequired(ctx *gin.Context, name string) (int64, bool) {
 	raw := ctx.Query(name)
 	if raw == "" {
