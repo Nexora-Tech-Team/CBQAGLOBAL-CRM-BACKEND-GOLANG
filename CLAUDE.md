@@ -565,18 +565,28 @@ Blocked      -> NEVER changes progress, not even from Done — pure
 
 **The key distinction that took three passes to nail down**: `blocked`
 truly never touches progress (confirmed twice), while `in_progress` and
-`in_review` both got an explicit *additional* condition — `base >= 100` —
-alongside their existing floor/reset-from-zero condition. A prior
-in-between value (say 45% or 95%) is still left alone in both; only
-exactly-100-carried-over-from-Done triggers the reset. Don't re-derive this
-rule from prose again if it comes up a third time — ask for the exact
-number per Done → X transition like the final round did, since a
-restated-in-words rule table has already proven ambiguous once here.
+`in_review` both got an explicit *additional* reset condition alongside
+their existing floor/reset-from-zero logic — `in_review` on `base >= 100`,
+`in_progress` on `base >= 90` (widened from `>= 100` in round 4 below,
+since In Review → In Progress needed the same reset as Done → In
+Progress). A prior in-between value below that threshold (say 45%) is
+still left alone in both. Don't re-derive this rule from prose again if it
+comes up yet again — ask for the exact number per specific `X → Y`
+transition like rounds 3-4 did, since a restated-in-words rule table has
+already proven ambiguous twice here.
+
+**Round 4 (2026-07-23, same day)**: In Review → In Progress was reported
+still not resetting — confirmed live it should also become 10%, same as
+Done → In Progress. Root cause: round 3's `in_progress` condition was
+`base == 0 || base >= 100`, so a task arriving from In Review (base 90-99)
+didn't qualify. Widened to `base == 0 || base >= 90` — 90+ only ever
+originates from In Review or Done, so both now reset In Progress the same
+way, while genuine paused/resumed in-progress work below 90% is untouched.
 
 No test file exists for this package yet (checked — `domain/pm/service` has
-no `_test.go`); all three revisions were verified via code trace plus
+no `_test.go`); all four revisions were verified via code trace plus
 `go build`/`go vet`, never a live write against the shared staging DB, to
 avoid mutating real project data for a manual test. A quick manual
-smoke-test in the actual UI (Task Detail drawer → Edit → change status from
-Done to each of In Review / In Progress / Blocked, confirm the % shown)
-would close the loop the code trace alone can't.
+smoke-test in the actual UI (Task Detail drawer → Edit → change status
+through Done → In Review → In Progress → Blocked, confirm the % shown at
+each step) would close the loop the code trace alone can't.

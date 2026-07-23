@@ -2385,13 +2385,15 @@ func progressPctFromRow(v interface{}) int64 {
 // manualProgress is a value the caller explicitly wants to set on this call
 // (nil if none, e.g. a plain drag-move never carries one); prevProgress is
 // the task's progress before this change. Confirmed rule table (2026-07-23,
-// second pass — see below for what changed from the first confirmation):
+// third pass — see History below for what changed across each round):
 //
 //	to_do       -> always 0
-//	in_progress -> 10 if it was 0 OR already 100 (i.e. regressing from
-//	               Done resets it exactly like a fresh start), otherwise
-//	               left unchanged (an interrupted-and-resumed task keeps
-//	               its in-between progress)
+//	in_progress -> 10 if it was 0 OR already >= 90 (i.e. arriving from
+//	               In Review OR Done both reset it exactly like a fresh
+//	               start — 90+ only ever comes from one of those two),
+//	               otherwise left unchanged (an interrupted-and-resumed
+//	               task below 90% keeps its in-between progress, e.g. 45%
+//	               stays 45%)
 //	in_review   -> floors at 90; ALSO snaps down to 90 if it arrives here
 //	               already at/above 100 (regressing from Done), not just
 //	               left at 100 — "under review" must never look identical
@@ -2402,14 +2404,21 @@ func progressPctFromRow(v interface{}) int64 {
 //	               progress signal of its own
 //	anything else -> manual value if given, else unchanged
 //
-// History: an earlier revision force-capped every non-Done status below
-// 100 (including blocked) — reverted same day because it broke Done ->
-// In Progress (should stay 100 per the FIRST confirmation) and Done ->
-// Blocked (should stay 100, confirmed above). Turned out both of those
-// were right to revert, but Done -> In Progress needed its own explicit
-// reset rule too (confirmed in this second pass: 10%, not "unchanged") —
-// the first confirmation's "otherwise unchanged" wording didn't actually
-// cover the from-Done case, only the general in-between-progress case.
+// History (all same day, each round tested live before the next):
+//  1. Force-capped every non-Done status below 100 (including blocked) —
+//     wrong, broke Done -> In Progress and would've broken Done -> Blocked.
+//  2. Reverted to the original pure-floor logic (in_progress/in_review
+//     never lower an already-higher value, blocked untouched) — matched
+//     the user's own restated rule table, but that wording ("otherwise
+//     unchanged") turned out ambiguous about the specific Done -> X case.
+//  3. Explicit per-transition confirmation: Done -> In Review = 90%,
+//     Done -> In Progress = 10%, Done -> Blocked = 100% (unchanged). Coded
+//     as `base >= 100` triggers on in_progress/in_review. Still incomplete:
+//  4. (this revision) In Review -> In Progress was ALSO expected to reset
+//     to 10%, not stay at its in_review value (90-99) — generalized the
+//     in_progress condition from `base >= 100` to `base >= 90`, since 90+
+//     only ever originates from In Review or Done, both of which should
+//     reset In Progress the same way.
 func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress *int64) int64 {
 	base := prevProgress
 	if manualProgress != nil {
@@ -2428,7 +2437,7 @@ func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress 
 		}
 		return base
 	case "in_progress":
-		if base == 0 || base >= 100 {
+		if base == 0 || base >= 90 {
 			return 10
 		}
 		return base
