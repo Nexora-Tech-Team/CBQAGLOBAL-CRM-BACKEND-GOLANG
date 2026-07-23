@@ -1,5 +1,57 @@
 # CI/CD — Go PM API
 
+## Staging (push-based deploy)
+
+Push to `staging` → `.github/workflows/deploy-staging.yml` builds the binary
+on a GitHub-hosted runner, then pushes it directly to the staging box
+(`212.85.25.165`, `api-pm-dev.nexoratech.co`) over SSH and runs
+`deploy-golang-staging.sh` there (backup → migrate → swap binary → restart →
+health-check → auto-rollback on failure). Push-based (unlike production,
+below) because this repo only has collaborator-level GitHub access here too,
+but the staging box accepts inbound SSH, so no polling/token dance is
+needed — just SSH credentials as GitHub Secrets.
+
+That box is **shared** with other projects (academy.nexoratech.co,
+alpha.nexoratech.co, a Java backend + a frontend, MariaDB, PHP-FPM, and
+their own self-hosted Actions runners) — the staging app lives in its own
+`/root/app/golang-pm-staging` directory, its own systemd unit
+(`cbqaglobal-golang-pm-staging`), and its own nginx vhost, so it shouldn't
+interfere with those.
+
+**Required GitHub configuration** (Settings → Environments → New environment
+`staging`, then add these as environment secrets — never commit them):
+
+| Secret | Value |
+|---|---|
+| `STAGING_SSH_HOST` | `212.85.25.165` |
+| `STAGING_SSH_USER` | `root` |
+| `STAGING_SSH_PASSWORD` | the VPS root password |
+
+One-time server setup (already done for the current box, kept here for
+reference / disaster recovery):
+
+```bash
+apt-get install -y postgresql-client
+mkdir -p /root/app/golang-pm-staging
+# .env seeded from this repo's .env.staging (POSTGRESQL_URL etc.)
+cp ops/cbqaglobal-golang-pm-staging.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now cbqaglobal-golang-pm-staging
+cp ops/nginx-api-pm-dev.nexoratech.co.conf /etc/nginx/sites-available/api-pm-dev.nexoratech.co
+ln -s /etc/nginx/sites-available/api-pm-dev.nexoratech.co /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+certbot --nginx -d api-pm-dev.nexoratech.co
+```
+
+Verify: `systemctl status cbqaglobal-golang-pm-staging`,
+`curl -s -o /dev/null -w '%{http_code}\n' https://api-pm-dev.nexoratech.co/api/v1/pm/task-statuses`
+(expect 200). Logs: `tail -f /root/app/golang-pm-staging/service.log`.
+
+Rollback: the deploy script auto-rolls back on a failed health check; to
+roll back manually, copy the newest file from
+`/root/app/golang-pm-staging/backups/` over `erp-cbqa-global` and
+`systemctl restart cbqaglobal-golang-pm-staging`.
+
 ## Production — dedicated PM API box (push-based deploy)
 
 Push to `main` → `.github/workflows/deploy-production.yml` builds the binary
@@ -8,7 +60,7 @@ production box (`72.60.74.36`, `api-pm-prod.cbqaglobal.co.id`) over SSH and
 runs `deploy-golang-prod.sh` there (backup → migrate → swap binary →
 restart → health-check → auto-rollback on failure). This box only hosts
 this API plus the CRM frontend's own prod deploy — no shared-tenancy
-concerns like the staging box below.
+concerns like the staging box above.
 
 **Required GitHub configuration** (Settings → Environments → New environment
 `production`, then add these as environment secrets — never commit them):

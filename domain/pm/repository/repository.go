@@ -4,11 +4,20 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 
 	"erp-cbqa-global/domain/pm/model"
 )
+
+// ErrAlreadyClockedIn: the user already has an open (ended_at IS NULL) time
+// log on some task — must clock out there before clocking in elsewhere.
+var ErrAlreadyClockedIn = errors.New("user already has an active clock-in on another task")
+
+// ErrNoActiveTimeLog: clock-out was requested but this user has no open
+// time log on this task to close.
+var ErrNoActiveTimeLog = errors.New("no active clock-in for this user on this task")
 
 type RepositoryInterface interface {
 	DashboardTotals() (model.Row, error)
@@ -60,6 +69,19 @@ type RepositoryInterface interface {
 	MoveProjectTaskByKey(id, statusKey string) error
 	DeleteProjectTask(id string) error
 	GanttMembers() ([]model.Row, error)
+	ActiveTaskProgressInputs() ([]model.Row, error)
+	ActiveChildTaskCount(parentTaskID string) (int64, error)
+
+	// Work Timer (clock in/out) — pm_task_time_logs.
+	ClockIn(taskID string, userID int64, projectID *int64) (model.Row, error)
+	ClockOut(taskID string, userID int64, note *string) (model.Row, error)
+	TimeLogsByTask(taskID string) ([]model.Row, error)
+	ActiveTimeLogForUser(userID int64) (model.Row, error)
+	TimeLogByID(id int64) (model.Row, error)
+	ManualLogOverlapExists(userID int64, startedAt, endedAt time.Time, excludeID *int64) (bool, error)
+	InsertManualTimeLog(fields map[string]interface{}) (model.Row, error)
+	UpdateTimeLog(id int64, fields map[string]interface{}) error
+	DeleteTimeLog(id int64) error
 
 	// Task activity log (pm_task_activity_logs) — audit trail for the Task
 	// Detail drawer's "Activity" section.
@@ -81,6 +103,24 @@ type RepositoryInterface interface {
 	InsertTimesheet(fields map[string]interface{}) (int64, error)
 	UpdateTimesheetStatus(id int64, status string, approvedBy *int64) error
 	DeleteTimesheet(id int64) error
+
+	// PM Dashboard summary (/v1/pm/dashboard/summary) — high-level portfolio
+	// monitoring aggregation. Each method below returns one flat, reusable
+	// dataset; the service layer joins them in memory (same N+1-avoidance
+	// pattern as CrmProjects + ActiveTaskProgressInputs).
+	PmPortfolioProjects() ([]model.Row, error)
+	PmPortfolioTasks() ([]model.Row, error)
+	PmMembersForWorkload() ([]model.Row, error)
+	PmActiveWorkSessions() ([]model.Row, error)
+	PmWeeklySecondsByUser() ([]model.Row, error)
+	PmRecentActivity(limit int) ([]model.Row, error)
+
+	// Team Workload period filter (/v1/pm/dashboard/team-workload,
+	// 2026-07-22) — same "one flat query per shape, join in memory" pattern
+	// as the block above, parameterized by an arbitrary [start, end) range
+	// instead of always being this-calendar-week.
+	PmWorkloadSecondsByUserForRange(start, end time.Time) ([]model.Row, error)
+	PmCompletedTasksByUserForRange(start, end time.Time) ([]model.Row, error)
 }
 
 type repository struct {
@@ -493,6 +533,48 @@ func (r *repository) LogActivity(action, logType, title string, typeID int64, lo
 // column — matching how Assignee is resolved on the Tasks tab. Updated is the
 // greatest of the project's own updated_at and its PM tasks' updated_at, so
 // the column reflects the most recent activity on the project.
+// taskStageJoinSQL aggregates each project's active (non-deleted) PM tasks
+// into per-status counts in one grouped pass, joined once per project — this
+// keeps the Stage computation below to a single query (no N+1 per-row task
+// lookups) for both the list and detail queries that embed it.
+//
+// LOWER(status) IN (...) tolerates status-key variants beyond the current
+// pm_task_statuses seed (to_do/in_progress/in_review/blocked/done) — e.g.
+// 'completed' as a synonym for 'done', or differently-cased values — without
+// requiring a migration if the Kanban's status vocabulary changes later.
+const taskStageJoinSQL = `
+		LEFT JOIN (
+		  SELECT
+		    crm_project_id,
+		    COUNT(*) AS total_tasks,
+		    COUNT(*) FILTER (WHERE LOWER(status) = 'blocked') AS blocked_tasks,
+		    COUNT(*) FILTER (WHERE LOWER(status) IN ('done', 'completed')) AS done_tasks,
+		    COUNT(*) FILTER (WHERE LOWER(status) = 'in_review') AS review_tasks,
+		    COUNT(*) FILTER (WHERE LOWER(status) = 'in_progress') AS progress_tasks
+		  FROM pm_project_tasks
+		  WHERE deleted = FALSE
+		  GROUP BY crm_project_id
+		) task_stage ON task_stage.crm_project_id = p.id`
+
+// taskStageCaseSQL derives Stage from the joined task_stage counts above.
+// Priority (highest first): Blocked > Completed > Review > In Progress > Planning.
+// Completed only fires once ALL active tasks are done (and at least one exists);
+// a project with zero active tasks is always Planning, regardless of any other
+// signal. This is the single source of truth for Stage — never set manually.
+// 'In Progress' was previously labeled 'Fieldwork' (renamed 2026-07-22 for a
+// more generic label that reads sensibly outside audit-specific projects) —
+// see CLAUDE.md for the full rename note, including the frontend normalizer
+// that maps any lingering old value for backward compatibility.
+const taskStageCaseSQL = `
+		  CASE
+		    WHEN COALESCE(task_stage.total_tasks, 0) = 0 THEN 'Planning'
+		    WHEN task_stage.blocked_tasks > 0 THEN 'Blocked'
+		    WHEN task_stage.done_tasks = task_stage.total_tasks THEN 'Completed'
+		    WHEN task_stage.review_tasks > 0 THEN 'Review'
+		    WHEN task_stage.progress_tasks > 0 THEN 'In Progress'
+		    ELSE 'Planning'
+		  END AS stage`
+
 func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 	s := like(search)
 	var rows []model.Row
@@ -509,6 +591,9 @@ func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 		  l.assigned_user_id,
 		  TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS assigned_user_name,
 		  NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), '') AS owner,
+		  pm.pic_user_id,
+		  NULLIF(TRIM(COALESCE(pu.first_name, '') || ' ' || COALESCE(pu.last_name, '')), '') AS pic,
+		  `+taskStageCaseSQL+`,
 		  GREATEST(
 		    p.updated_at,
 		    (SELECT MAX(t.updated_at) FROM pm_project_tasks t WHERE t.crm_project_id = p.id AND t.deleted = FALSE)
@@ -520,6 +605,9 @@ func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 		JOIN services s ON s.id = ps.service_id
 		LEFT JOIN users u ON u.id = l.assigned_user_id
 		LEFT JOIN users cu ON cu.id = p.cuser_id
+		LEFT JOIN pm_projects pm ON pm.crm_project_id = p.id AND pm.deleted = FALSE
+		LEFT JOIN users pu ON pu.id = pm.pic_user_id
+		`+taskStageJoinSQL+`
 		WHERE s.name IN ('Advisory', 'Audit Program')
 		  AND (?::text IS NULL
 		       OR LOWER(COALESCE(l.project_name, c.company_name)) LIKE ?
@@ -549,12 +637,14 @@ func (r *repository) CrmProjectByID(id int64) (model.Row, error) {
 		  p.assigned_to AS owner,
 		  pm.pic_user_id,
 		  NULLIF(TRIM(COALESCE(pu.first_name, '') || ' ' || COALESCE(pu.last_name, '')), '') AS pic,
+		  `+taskStageCaseSQL+`,
 		  p.updated_at
 		FROM projects p
 		JOIN leads l ON l.id = p.lead_id
 		JOIN companies c ON c.id = l.company_id
 		LEFT JOIN pm_projects pm ON pm.crm_project_id = p.id AND pm.deleted = FALSE
 		LEFT JOIN users pu ON pu.id = pm.pic_user_id
+		`+taskStageJoinSQL+`
 		WHERE p.id = ?
 		LIMIT 1
 	`, id).Scan(&rows).Error
@@ -697,6 +787,237 @@ func (r *repository) MoveProjectTaskByKey(id, statusKey string) error {
 
 func (r *repository) DeleteProjectTask(id string) error {
 	return r.DB.Exec(`UPDATE pm_project_tasks SET deleted = TRUE, updated_at = NOW() WHERE id = ?`, id).Error
+}
+
+// ActiveTaskProgressInputs returns the minimal fields needed to compute
+// effective task/parent/project progress (see computeTaskProgress in
+// service.go) across ALL CRM-linked projects in one query — used by the
+// CrmProjects list so per-project progress never costs an extra query per
+// project row. Unscoped by project on purpose: this table is small (PM task
+// counts run in the tens-to-hundreds, not pagination-scale), so one flat
+// fetch + in-memory grouping is simpler and safer than assembling a dynamic
+// project-id IN(...)/ANY(...) list.
+func (r *repository) ActiveTaskProgressInputs() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT id::text AS id, crm_project_id, parent_task_id::text AS parent_task_id,
+		       status, progress_pct
+		FROM pm_project_tasks
+		WHERE deleted = FALSE
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// ActiveChildTaskCount reports how many active (non-deleted) direct children
+// a task has. A count > 0 makes the task a "parent" whose progress is always
+// derived from those children — used to reject/ignore a manual progress
+// edit aimed at a parent task (see UpdateProjectTask).
+func (r *repository) ActiveChildTaskCount(parentTaskID string) (int64, error) {
+	var count int64
+	err := r.DB.Raw(`
+		SELECT COUNT(*) FROM pm_project_tasks WHERE parent_task_id = ? AND deleted = FALSE
+	`, parentTaskID).Scan(&count).Error
+	return count, err
+}
+
+// timeLogSelectSQL is shared by every read path that returns a
+// pm_task_time_logs row (clock-in/out responses, TimeLogsByTask,
+// ActiveTimeLogForUser) so the shape can never drift between them.
+// task_id::text avoids the same uuid-column-scans-as-[]byte JSON encoding
+// bug documented on ProjectTasksByCrmProject above.
+const timeLogSelectSQL = `
+	SELECT tl.id, tl.task_id::text AS task_id, tl.project_id, tl.user_id,
+	       tl.started_at, tl.ended_at, tl.duration_seconds, tl.note,
+	       tl.source, tl.created_by, tl.updated_by,
+	       tl.created_at, tl.updated_at,
+	       NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS user_name
+	FROM pm_task_time_logs tl
+	LEFT JOIN users u ON u.id = tl.user_id
+`
+
+// ClockIn opens a new time-log session for userID on taskID. Transactional:
+// re-checks for an existing open session under the transaction before
+// inserting, and the UNIQUE partial index (migration 013) is the hard
+// backstop against a concurrent double clock-in slipping through the gap
+// between that check and the insert.
+func (r *repository) ClockIn(taskID string, userID int64, projectID *int64) (model.Row, error) {
+	var result model.Row
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var openCount int64
+		if err := tx.Raw(`
+			SELECT COUNT(*) FROM pm_task_time_logs
+			WHERE user_id = ? AND ended_at IS NULL AND deleted_at IS NULL
+		`, userID).Scan(&openCount).Error; err != nil {
+			return err
+		}
+		if openCount > 0 {
+			return ErrAlreadyClockedIn
+		}
+
+		var id int64
+		if err := tx.Raw(`
+			INSERT INTO pm_task_time_logs (task_id, project_id, user_id, started_at, source, created_by, updated_by, created_at, updated_at)
+			VALUES (?, ?, ?, NOW(), 'realtime', ?, ?, NOW(), NOW())
+			RETURNING id
+		`, taskID, projectID, userID, userID, userID).Scan(&id).Error; err != nil {
+			return err
+		}
+
+		var rows []model.Row
+		if err := tx.Raw(timeLogSelectSQL+` WHERE tl.id = ?`, id).Scan(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return errors.New("time log not found after insert")
+		}
+		result = rows[0]
+		return nil
+	})
+	return result, err
+}
+
+// ClockOut closes userID's open session on taskID: sets ended_at to now,
+// computes duration_seconds from started_at, and stores note if given.
+func (r *repository) ClockOut(taskID string, userID int64, note *string) (model.Row, error) {
+	var result model.Row
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var rows []model.Row
+		if err := tx.Raw(`
+			SELECT id FROM pm_task_time_logs
+			WHERE task_id = ? AND user_id = ? AND ended_at IS NULL AND deleted_at IS NULL
+			ORDER BY id DESC LIMIT 1
+		`, taskID, userID).Scan(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return ErrNoActiveTimeLog
+		}
+		id, _ := toInt64(rows[0]["id"])
+
+		if err := tx.Exec(`
+			UPDATE pm_task_time_logs
+			SET ended_at = NOW(),
+			    duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (NOW() - started_at))::bigint),
+			    note = COALESCE(?, note),
+			    updated_at = NOW()
+			WHERE id = ?
+		`, note, id).Error; err != nil {
+			return err
+		}
+
+		var closed []model.Row
+		if err := tx.Raw(timeLogSelectSQL+` WHERE tl.id = ?`, id).Scan(&closed).Error; err != nil {
+			return err
+		}
+		if len(closed) == 0 {
+			return errors.New("time log not found after close")
+		}
+		result = closed[0]
+		return nil
+	})
+	return result, err
+}
+
+// TimeLogsByTask returns every session (open or closed) logged against a
+// task, newest first — the Work Logs panel's data source.
+func (r *repository) TimeLogsByTask(taskID string) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(timeLogSelectSQL+`
+		WHERE tl.task_id = ? AND tl.deleted_at IS NULL
+		ORDER BY tl.started_at DESC, tl.id DESC
+	`, taskID).Scan(&rows).Error
+	return rows, err
+}
+
+// ActiveTimeLogForUser returns userID's single open session, if any —
+// across ALL tasks, not scoped to one. Used both to answer
+// GET /time-logs/active and, from the service layer, to build the
+// "clocked in on another task" message when a clock-in is rejected.
+func (r *repository) ActiveTimeLogForUser(userID int64) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(timeLogSelectSQL+`
+		WHERE tl.user_id = ? AND tl.ended_at IS NULL AND tl.deleted_at IS NULL
+		ORDER BY tl.id DESC LIMIT 1
+	`, userID).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return rows[0], nil
+}
+
+// TimeLogByID fetches a single (non-deleted) time log row — used by the
+// manual-log edit/delete paths to load the "before" state for a permission
+// check and an activity-log diff.
+func (r *repository) TimeLogByID(id int64) (model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(timeLogSelectSQL+` WHERE tl.id = ? AND tl.deleted_at IS NULL`, id).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, errors.New("time log not found")
+	}
+	return rows[0], nil
+}
+
+// ManualLogOverlapExists reports whether [startedAt, endedAt] would overlap
+// any of userID's existing (non-deleted) sessions — a closed session uses
+// its own stored ended_at; an open (active clock-in) session is treated as
+// extending to infinity, so a manual entry can never silently double-book
+// time that's already being tracked live. excludeID lets an edit ignore its
+// own row when re-checking a changed time range.
+func (r *repository) ManualLogOverlapExists(userID int64, startedAt, endedAt time.Time, excludeID *int64) (bool, error) {
+	var count int64
+	err := r.DB.Raw(`
+		SELECT COUNT(*) FROM pm_task_time_logs
+		WHERE user_id = ?
+		  AND deleted_at IS NULL
+		  AND (?::bigint IS NULL OR id != ?)
+		  AND tsrange(started_at, COALESCE(ended_at, 'infinity'::timestamp), '[]')
+		      && tsrange(?::timestamp, ?::timestamp, '[]')
+	`, userID, excludeID, excludeID, startedAt, endedAt).Scan(&count).Error
+	return count > 0, err
+}
+
+// InsertManualTimeLog creates a closed (already has ended_at/duration_seconds)
+// manual session and returns its full row. Unlike ClockIn/ClockOut, this
+// never runs inside a transaction with a lock check — the overlap check
+// (ManualLogOverlapExists) already ran in the service layer immediately
+// before this call; a manual entry has no "only one at a time" constraint
+// to protect (that's specific to *active* clock-ins), so the extra
+// transaction wrapping ClockIn/ClockOut needs would just be overhead here.
+func (r *repository) InsertManualTimeLog(fields map[string]interface{}) (model.Row, error) {
+	columns, placeholders, values := buildInsert(fields)
+	var id int64
+	sql := fmt.Sprintf(`INSERT INTO pm_task_time_logs (%s) VALUES (%s) RETURNING id`, columns, placeholders)
+	if err := r.DB.Raw(sql, values...).Scan(&id).Error; err != nil {
+		return nil, err
+	}
+	return r.TimeLogByID(id)
+}
+
+// UpdateTimeLog patches an existing (non-deleted) time log — used by the
+// manual-log edit endpoint. Recomputes nothing itself; the service layer
+// passes whatever fields (including a freshly recomputed duration_seconds,
+// if the time range changed) need to change.
+func (r *repository) UpdateTimeLog(id int64, fields map[string]interface{}) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	set, values := buildUpdate(fields)
+	values = append(values, id)
+	sql := fmt.Sprintf(`UPDATE pm_task_time_logs SET %s, updated_at = NOW() WHERE id = ? AND deleted_at IS NULL`, set)
+	return r.DB.Exec(sql, values...).Error
+}
+
+// DeleteTimeLog soft-deletes a time log — same convention as
+// DeleteProjectTask, so history remains queryable/auditable even after
+// "deletion".
+func (r *repository) DeleteTimeLog(id int64) error {
+	return r.DB.Exec(`UPDATE pm_task_time_logs SET deleted_at = NOW(), updated_at = NOW() WHERE id = ?`, id).Error
 }
 
 // InsertTaskActivityLog appends one audit-trail row. Never deleted alongside
@@ -946,6 +1267,234 @@ func (r *repository) UpdateTimesheetStatus(id int64, status string, approvedBy *
 
 func (r *repository) DeleteTimesheet(id int64) error {
 	return r.DB.Exec(`UPDATE pm_timesheets SET deleted = TRUE, updated_at = NOW() WHERE id = ?`, id).Error
+}
+
+// ─── PM Dashboard summary (/v1/pm/dashboard/summary) ───────────────────────
+
+// planWindowJoinSQL aggregates each project's task-level plan_start/plan_end
+// window (MIN(start_date)/MAX(deadline) across its active tasks) in one
+// grouped pass, mirroring taskStageJoinSQL's shape/rationale. The service
+// layer falls back to the project's own project_date/valid_until when a
+// project has no tasks yet (see PmPortfolioProjects' COALESCE below) so a
+// brand-new Planning project still has a usable plan window for the
+// planned-vs-actual progress comparison.
+const planWindowJoinSQL = `
+		LEFT JOIN (
+		  SELECT crm_project_id,
+		         MIN(start_date) AS min_start_date,
+		         MAX(deadline) AS max_deadline
+		  FROM pm_project_tasks
+		  WHERE deleted = FALSE
+		  GROUP BY crm_project_id
+		) plan_window ON plan_window.crm_project_id = p.id`
+
+// PmPortfolioProjects returns one row per CRM-linked PM project (same
+// Advisory/Audit Program service scope as CrmProjects) with everything the
+// dashboard needs to derive Stage, Health, and the planned-progress side of
+// Portfolio Progress without a second per-project query: the task_stage
+// counts (reused from taskStageJoinSQL/taskStageCaseSQL — Stage must never
+// be re-derived differently in two places), and the plan_start/plan_end
+// window. Actual progress is intentionally NOT computed here — it comes
+// from PmPortfolioTasks + the existing computeTaskProgress/
+// projectProgressFromTasks helpers, so list/detail/dashboard progress can
+// never disagree.
+func (r *repository) PmPortfolioProjects() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT DISTINCT
+		  p.id AS crm_project_id,
+		  p.id,
+		  p.project_date,
+		  COALESCE(l.project_name, c.company_name) AS title,
+		  p.assigned_to AS owner_name,
+		  NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), '') AS owner,
+		  NULLIF(TRIM(COALESCE(pu.first_name, '') || ' ' || COALESCE(pu.last_name, '')), '') AS pic,
+		  ` + taskStageCaseSQL + `,
+		  COALESCE(task_stage.total_tasks, 0) AS total_tasks,
+		  COALESCE(task_stage.blocked_tasks, 0) AS blocked_tasks,
+		  COALESCE(task_stage.done_tasks, 0) AS done_tasks,
+		  COALESCE(task_stage.review_tasks, 0) AS review_tasks,
+		  COALESCE(task_stage.progress_tasks, 0) AS progress_tasks,
+		  COALESCE(plan_window.min_start_date, p.project_date) AS plan_start,
+		  COALESCE(plan_window.max_deadline, p.valid_until) AS plan_end,
+		  GREATEST(
+		    p.updated_at,
+		    (SELECT MAX(t.updated_at) FROM pm_project_tasks t WHERE t.crm_project_id = p.id AND t.deleted = FALSE)
+		  ) AS updated_at
+		FROM projects p
+		JOIN leads l ON l.id = p.lead_id
+		JOIN companies c ON c.id = l.company_id
+		JOIN project_services ps ON ps.project_id = p.id
+		JOIN services s ON s.id = ps.service_id
+		LEFT JOIN users cu ON cu.id = p.cuser_id
+		LEFT JOIN pm_projects pm ON pm.crm_project_id = p.id AND pm.deleted = FALSE
+		LEFT JOIN users pu ON pu.id = pm.pic_user_id
+		` + taskStageJoinSQL + `
+		` + planWindowJoinSQL + `
+		WHERE s.name IN ('Advisory', 'Audit Program')
+		ORDER BY p.project_date DESC NULLS LAST
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmPortfolioTasks returns every non-deleted PM task (unscoped by project,
+// same rationale as ActiveTaskProgressInputs — this table is small enough
+// that one flat fetch + in-memory grouping beats a per-project query) with
+// the extra columns (title, deadline, assigned_to/assignee_name) the
+// dashboard needs for team workload, overdue detection, and upcoming
+// deadlines, on top of the id/parent_task_id/status/progress_pct shape
+// ActiveTaskProgressInputs already exposes for computeTaskProgress.
+func (r *repository) PmPortfolioTasks() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT t.id::text AS id, t.crm_project_id, t.parent_task_id::text AS parent_task_id,
+		       t.status, t.progress_pct, t.title, t.deadline, t.assigned_to,
+		       NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS assignee_name
+		FROM pm_project_tasks t
+		LEFT JOIN users u ON u.id = t.assigned_to
+		WHERE t.deleted = FALSE
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmMembersForWorkload is GanttMembers' exact WHERE clause (IT Audit
+// department, active internal users) plus job_title, added as a separate
+// method rather than widening GanttMembers itself so the existing
+// assignee-picker endpoint's shape/behavior can't drift by accident.
+func (r *repository) PmMembersForWorkload() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT DISTINCT u.id, TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name,
+		       u.job_title, u.employee_id AS code, u.email
+		FROM users u
+		INNER JOIN departements d ON d.id = u.departement_id
+		WHERE u.dtype = 'INTERNAL_USER' AND (u.status IS NULL OR u.status <> '0')
+		  AND d.name = 'IT Audit'
+		ORDER BY name ASC
+		LIMIT 500
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmActiveWorkSessions lists every currently open (ended_at IS NULL) time
+// log across ALL users — the org-wide "who's clocked in right now" view.
+// Unlike ActiveTimeLogForUser (scoped to one user, used by the Work Timer
+// widget), this powers both the dashboard's Active Work Sessions panel and
+// each Team Workload row's currentClockIn. The unique partial index backing
+// ClockIn guarantees at most one open row per user, so grouping this result
+// by user_id in the service layer is safe.
+func (r *repository) PmActiveWorkSessions() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT tl.user_id, tl.task_id::text AS task_id, tl.project_id, tl.started_at,
+		       NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS member_name,
+		       t.title AS task_title,
+		       (t.parent_task_id IS NOT NULL) AS is_subtask,
+		       COALESCE(l.project_name, c.company_name) AS project_title
+		FROM pm_task_time_logs tl
+		LEFT JOIN users u ON u.id = tl.user_id
+		LEFT JOIN pm_project_tasks t ON t.id = tl.task_id
+		LEFT JOIN projects p ON p.id = tl.project_id
+		LEFT JOIN leads l ON l.id = p.lead_id
+		LEFT JOIN companies c ON c.id = l.company_id
+		WHERE tl.ended_at IS NULL AND tl.deleted_at IS NULL
+		ORDER BY tl.started_at ASC
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmWeeklySecondsByUser sums each user's tracked time for the current
+// calendar week (date_trunc('week', NOW()), matching TimesheetSummary's own
+// week-bucketing convention so the two "hours this week" concepts in this
+// codebase stay defined the same way): closed sessions contribute their
+// stored duration_seconds when they STARTED this week, and any still-open
+// session contributes its live elapsed time regardless of when it started
+// (a session spanning a week boundary is a rare edge case; counting its
+// running total against the current week is the more useful "what's
+// happening right now" answer for a live dashboard than splitting it).
+func (r *repository) PmWeeklySecondsByUser() ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT user_id,
+		  COALESCE(SUM(duration_seconds) FILTER (
+		    WHERE ended_at IS NOT NULL AND started_at >= date_trunc('week', NOW())
+		  ), 0)
+		  + COALESCE(SUM(EXTRACT(EPOCH FROM (NOW() - started_at))::bigint) FILTER (
+		    WHERE ended_at IS NULL
+		  ), 0) AS total_seconds
+		FROM pm_task_time_logs
+		WHERE deleted_at IS NULL
+		GROUP BY user_id
+	`).Scan(&rows).Error
+	return rows, err
+}
+
+// PmRecentActivity is TaskActivityLogs widened from "one task" to "every
+// task, most recent first" — the dashboard's Recent Activity feed. Returns
+// whatever action/description rows actually exist (created/subtask_created/
+// updated+field_name/clock_in/clock_out/manual_log_*/deleted, see
+// logTaskActivity call sites in service.go); there is currently no
+// project-level "project updated" or "member added" entry logged anywhere
+// in this codebase, so those categories simply won't appear until/unless
+// UpdateCrmProject and InsertCrmProjectMember start logging too — never
+// fabricated here.
+func (r *repository) PmRecentActivity(limit int) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT id, task_id::text AS task_id, project_id, actor_user_id, actor_name,
+		       action, field_name, old_value, new_value, description, created_at
+		FROM pm_task_activity_logs
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, limit).Scan(&rows).Error
+	return rows, err
+}
+
+// PmWorkloadSecondsByUserForRange sums each user's CLOSED time-log sessions
+// (ended_at IS NOT NULL, so both finished realtime clock sessions and manual
+// work logs — a manual entry is always inserted already-closed) whose
+// started_at falls in [start, end). Deliberately does NOT add any
+// still-open session's live elapsed time — unlike PmWeeklySecondsByUser
+// (the always-"this week" summary card, which does include the running
+// session for a "what's happening right now" feel), a period-scoped report
+// should show a stable, reproducible number that doesn't change every
+// second while a session is still in progress. See CLAUDE.md for the full
+// rationale ("the safest option" the task asked for).
+func (r *repository) PmWorkloadSecondsByUserForRange(start, end time.Time) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT user_id, COALESCE(SUM(duration_seconds), 0) AS period_seconds
+		FROM pm_task_time_logs
+		WHERE deleted_at IS NULL
+		  AND ended_at IS NOT NULL
+		  AND started_at >= ? AND started_at < ?
+		GROUP BY user_id
+	`, start, end).Scan(&rows).Error
+	return rows, err
+}
+
+// PmCompletedTasksByUserForRange counts each assignee's tasks that became
+// Done within [start, end), keyed off status_changed_at (the same column
+// MoveProjectTaskByKey/UpdateProjectTask already stamp on every status
+// transition — no new column needed). Best-effort: status_changed_at only
+// holds the LATEST transition, so a task that went Done then got reopened
+// then Done again within the same window is still counted once, correctly;
+// one that was completed in a past period and never touched again keeps
+// its original status_changed_at and correctly stops counting once the
+// period moves on.
+func (r *repository) PmCompletedTasksByUserForRange(start, end time.Time) ([]model.Row, error) {
+	var rows []model.Row
+	err := r.DB.Raw(`
+		SELECT assigned_to AS user_id, COUNT(*) AS completed_tasks
+		FROM pm_project_tasks
+		WHERE deleted = FALSE
+		  AND LOWER(status) IN ('done', 'completed')
+		  AND status_changed_at IS NOT NULL
+		  AND status_changed_at >= ? AND status_changed_at < ?
+		  AND assigned_to IS NOT NULL
+		GROUP BY assigned_to
+	`, start, end).Scan(&rows).Error
+	return rows, err
 }
 
 func buildInsert(fields map[string]interface{}) (columns string, placeholders string, values []interface{}) {

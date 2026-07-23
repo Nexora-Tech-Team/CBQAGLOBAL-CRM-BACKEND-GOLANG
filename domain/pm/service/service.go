@@ -1,7 +1,10 @@
 package service
 
 import (
+	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +14,11 @@ import (
 	"erp-cbqa-global/domain/pm/model"
 	"erp-cbqa-global/domain/pm/repository"
 )
+
+// ErrInvalidWorkloadPeriod marks a bad `period`/`month` query param on
+// GET /v1/pm/dashboard/team-workload — the controller maps this to 400,
+// any other error from that path to 500.
+var ErrInvalidWorkloadPeriod = errors.New("invalid workload period")
 
 type ServiceInterface interface {
 	Dashboard(crmProjectID, memberID *int64) (model.Row, error)
@@ -45,6 +53,15 @@ type ServiceInterface interface {
 	TaskActivityLogs(taskID string) ([]model.Row, error)
 	GanttMembers() ([]model.Row, error)
 
+	// Work Timer (clock in/out) — pm_task_time_logs.
+	ClockInTask(taskID string, userID int64, actorUserIDRaw interface{}) (model.Row, error)
+	ClockOutTask(taskID string, userID int64, note *string, actorUserIDRaw interface{}) (model.Row, error)
+	TaskTimeLogs(taskID string, userID int64) (model.Row, error)
+	ActiveTimeLogForUser(userID int64) (model.Row, error)
+	CreateManualTimeLog(taskID string, body map[string]interface{}, actorUserIDRaw interface{}) (model.Row, error)
+	UpdateManualTimeLog(logID int64, body map[string]interface{}, actorUserIDRaw interface{}) (model.Row, error)
+	DeleteManualTimeLog(logID int64, actorUserIDRaw interface{}) error
+
 	CrmProjectMembers(crmProjectID int64) ([]model.Row, error)
 	AddCrmProjectMember(crmProjectID int64, body map[string]interface{}, userID string) (model.Row, error)
 	UpdateCrmProjectMember(crmProjectID int64, memberID string, body map[string]interface{}) (model.Row, error)
@@ -54,6 +71,21 @@ type ServiceInterface interface {
 	CreateTimesheet(req model.TimesheetRequest) (model.Row, error)
 	UpdateTimesheetStatus(id int64, status string, approvedBy *int64) (model.Row, error)
 	DeleteTimesheet(id int64) error
+
+	// DashboardSummary powers /v1/pm/dashboard/summary — the high-level PM
+	// portfolio monitoring dashboard (project health, portfolio progress,
+	// team workload, active work sessions, upcoming deadlines, recent
+	// activity). See the doc comment on the implementation for the exact
+	// response shape and every derivation rule.
+	DashboardSummary() (model.Row, error)
+
+	// TeamWorkloadByPeriod powers /v1/pm/dashboard/team-workload — the same
+	// Team Workload data as DashboardSummary's teamWorkload, but scoped to
+	// an arbitrary period (this_week/this_month/custom_month) instead of
+	// always being the current calendar week. See the implementation's doc
+	// comment for period resolution rules and CLAUDE.md for the full
+	// formula writeup.
+	TeamWorkloadByPeriod(periodType, monthParam string) (model.Row, error)
 }
 
 type pmService struct {
@@ -340,7 +372,32 @@ func (s *pmService) ActivityLogs() ([]model.Row, error) {
 }
 
 func (s *pmService) CrmProjects(search string) ([]model.Row, error) {
-	return s.Repository.CrmProjects(search)
+	rows, err := s.Repository.CrmProjects(search)
+	if err != nil {
+		return nil, err
+	}
+
+	// One extra flat query for every active task across every project,
+	// grouped in memory by crm_project_id — the alternative (fetch tasks
+	// per project row) is exactly the N+1 pattern this needs to avoid.
+	tasks, err := s.Repository.ActiveTaskProgressInputs()
+	if err != nil {
+		for _, row := range rows {
+			row["progress"] = int64(0)
+		}
+		return rows, nil
+	}
+	tasksByProject := make(map[int64][]model.Row, len(rows))
+	for _, t := range tasks {
+		pid, _ := toInt64(t["crm_project_id"])
+		tasksByProject[pid] = append(tasksByProject[pid], t)
+	}
+	for _, row := range rows {
+		pid, _ := toInt64(row["crm_project_id"])
+		projectTasks := tasksByProject[pid]
+		row["progress"] = projectProgressFromTasks(projectTasks, computeTaskProgress(projectTasks))
+	}
+	return rows, nil
 }
 
 // UpdateCrmProjectOverview saves the PM Overview tab's editable fields:
@@ -396,28 +453,16 @@ func (s *pmService) CrmProjectDetail(id int64) (model.Row, error) {
 		activity = []model.Row{}
 	}
 
-	// No dedicated "stage" column exists for CRM-linked PM projects yet, so
-	// derive a reasonable approximation from real task completion instead of
-	// a fixed value.
-	total := len(tasks)
-	done := 0
-	for _, t := range tasks {
-		if str(t["status"]) == "done" {
-			done++
-		}
-	}
-	progress := 0
-	if total > 0 {
-		progress = done * 100 / total
-	}
-	stage := "Planning"
-	if total > 0 {
-		if progress == 100 {
-			stage = "Closed"
-		} else {
-			stage = "Fieldwork"
-		}
-	}
+	// Progress is a separate metric from Stage: Stage comes straight from
+	// row["stage"], computed by the CrmProjectByID SQL query (task_stage
+	// CASE) — never touched here. Progress is computed bottom-up from each
+	// task's status (and, for parent tasks, their active children) via
+	// computeTaskProgress — the same helper CrmProjects (list) and
+	// TasksByCrmProject use, so list/detail/task-tab progress can never
+	// disagree. applyTaskProgress overrides each task row's progress_pct in
+	// place with its effective value and tags has_active_subtasks.
+	progressByTask := applyTaskProgress(tasks)
+	projectProgress := projectProgressFromTasks(tasks, progressByTask)
 
 	result := model.Row{}
 	for k, v := range row {
@@ -426,13 +471,44 @@ func (s *pmService) CrmProjectDetail(id int64) (model.Row, error) {
 	result["tasks"] = tasks
 	result["team"] = team
 	result["activity"] = activity
-	result["stage"] = stage
-	result["progress"] = progress
+	result["progress"] = projectProgress
 	return result, nil
 }
 
 func (s *pmService) TasksByCrmProject(id int64) ([]model.Row, error) {
-	return s.Repository.ProjectTasksByCrmProject(id)
+	tasks, err := s.Repository.ProjectTasksByCrmProject(id)
+	if err != nil {
+		return nil, err
+	}
+	applyTaskProgress(tasks)
+	return tasks, nil
+}
+
+// attachEffectiveProgress recomputes progress for a single task by pulling
+// every active task in its project (one query) and running the same
+// computeTaskProgress used by CrmProjectDetail/CrmProjects/TasksByCrmProject
+// — guarantees a create/update/move response always matches what the very
+// next list/detail fetch would show for that task, per the requirement that
+// a write must be reflected by the next response, not just eventually.
+func (s *pmService) attachEffectiveProgress(crmProjectID int64, row model.Row) (model.Row, error) {
+	tasks, err := s.Repository.ProjectTasksByCrmProject(crmProjectID)
+	if err != nil {
+		return row, nil // don't fail the whole write just because the progress refresh couldn't run
+	}
+	progress := applyTaskProgress(tasks)
+	if p, ok := progress[str(row["id"])]; ok {
+		row["progress_pct"] = p.Progress
+		row["has_active_subtasks"] = p.IsParent
+		if p.IsParent {
+			row["status"] = p.Status
+			row["status_key"] = p.Status
+			if meta, ok := statusMeta[p.Status]; ok {
+				row["status_title"] = meta.Title
+				row["status_color"] = meta.Color
+			}
+		}
+	}
+	return row, nil
 }
 
 func (s *pmService) CrmProjectMembers(crmProjectID int64) ([]model.Row, error) {
@@ -504,6 +580,17 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 		return nil, err
 	}
 
+	// A brand-new task always starts as a leaf (it can't have children yet),
+	// so its initial progress follows the same leaf status rule table used
+	// everywhere else — a manual progressPct in the body still wins, but
+	// to_do/done/in_review/in_progress floors and ceilings still apply.
+	var initialManualProgress *int64
+	if _, ok := body["progressPct"]; ok {
+		v := clampPercent(int64FromAny(body["progressPct"], 0))
+		initialManualProgress = &v
+	}
+	initialProgress := leafProgressForStatus(statusKey, 0, initialManualProgress)
+
 	id := uuid.NewString()
 	fields := map[string]interface{}{
 		"id":                 id,
@@ -516,7 +603,7 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 		"actual_finish_date": parseDateTime(strPtrFromAny(body["actualFinishDate"])),
 		"collaborators":      strPtrFromAny(body["collaborators"]),
 		"priority_id":        int64FromAny(body["priorityId"], 0),
-		"progress_pct":       clampPercent(int64FromAny(body["progressPct"], 0)),
+		"progress_pct":       initialProgress,
 		"status":             statusKey,
 		"status_id":          statusID,
 		"parent_task_id":     uuidPtrFromAny(body["parentTaskId"]),
@@ -535,7 +622,15 @@ func (s *pmService) CreateTaskForCrmProject(crmProjectID int64, body map[string]
 	}
 	s.logTaskActivity(id, crmProjectID, actorUserID, actorName, action, "", nil, strPtr(title), description)
 
-	return s.Repository.ProjectTaskByID(id)
+	created, err := s.Repository.ProjectTaskByID(id)
+	if err != nil {
+		return nil, err
+	}
+	// A new subtask changes its parent's (and the project's) effective
+	// progress — attachEffectiveProgress recomputes from the whole project's
+	// current task set, so this is reflected immediately, not just on the
+	// next unrelated fetch.
+	return s.attachEffectiveProgress(crmProjectID, created)
 }
 
 func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (model.Row, error) {
@@ -546,6 +641,12 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 	if err != nil {
 		return nil, err
 	}
+	childCount, err := s.Repository.ActiveChildTaskCount(id)
+	if err != nil {
+		return nil, err
+	}
+	isParent := childCount > 0
+
 	fields := map[string]interface{}{}
 	if title, ok := body["title"].(string); ok && strings.TrimSpace(title) != "" {
 		fields["title"] = title
@@ -571,16 +672,23 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 	if _, ok := body["priorityId"]; ok {
 		fields["priority_id"] = int64FromAny(body["priorityId"], 0)
 	}
-	if _, ok := body["progressPct"]; ok {
-		fields["progress_pct"] = clampPercent(int64FromAny(body["progressPct"], 0))
-	}
 	if _, ok := body["assignedTo"]; ok {
 		fields["assigned_to"] = int64PtrFromAny(body["assignedTo"])
 	}
 	if _, ok := body["parentTaskId"]; ok {
 		fields["parent_task_id"] = uuidPtrFromAny(body["parentTaskId"])
 	}
-	if statusRaw, ok := body["status"].(string); ok && strings.TrimSpace(statusRaw) != "" {
+
+	// Resolve the status this task will have AFTER this update (its new
+	// value if provided, else whatever it already had) — needed even when
+	// only progressPct changes, since the leaf progress rule depends on it.
+	// A parent task's status is always derived from its children on read
+	// (see deriveParentStatus/computeTaskProgress) exactly like its
+	// progress — a manual status change aimed at one is silently dropped,
+	// same reasoning as the progress guard below (the request may
+	// legitimately be touching unrelated fields in the same call).
+	newStatusKey := str(before["status"])
+	if statusRaw, ok := body["status"].(string); ok && strings.TrimSpace(statusRaw) != "" && !isParent {
 		statusID, err := s.Repository.ResolveStatusID(nil, statusRaw)
 		if err != nil {
 			return nil, err
@@ -592,7 +700,29 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 		fields["status"] = statusKey
 		fields["status_id"] = statusID
 		fields["status_changed_at"] = time.Now().UTC()
+		newStatusKey = statusKey
 	}
+
+	// Progress: a parent task's progress is always derived from its children
+	// on read (see computeTaskProgress) — a manual progressPct aimed at one
+	// is silently dropped here rather than erroring, since the same request
+	// may legitimately be updating unrelated fields (title, assignee, ...).
+	// Leaf tasks route through leafProgressForStatus so a manual edit and/or
+	// a status change both still respect the to_do/in_review/done floors
+	// and ceilings, exactly like Kanban drag-move does.
+	if !isParent {
+		_, progressProvided := body["progressPct"]
+		_, statusChanged := fields["status"]
+		if progressProvided || statusChanged {
+			var manual *int64
+			if progressProvided {
+				v := clampPercent(int64FromAny(body["progressPct"], 0))
+				manual = &v
+			}
+			fields["progress_pct"] = leafProgressForStatus(newStatusKey, progressPctFromRow(before["progress_pct"]), manual)
+		}
+	}
+
 	if len(fields) > 0 {
 		if err := s.Repository.UpdateProjectTask(id, fields); err != nil {
 			return nil, err
@@ -604,7 +734,8 @@ func (s *pmService) UpdateProjectTask(id string, body map[string]interface{}) (m
 	}
 	actorUserID, actorName := s.resolveActor(actorSource(body, ""))
 	s.logTaskFieldChanges(id, before, after, actorUserID, actorName)
-	return after, nil
+
+	return s.attachEffectiveProgress(projectIDFromRow(after), after)
 }
 
 func (s *pmService) MoveProjectTaskByKey(id, statusKey string, actorUserIDRaw interface{}) (model.Row, error) {
@@ -615,16 +746,38 @@ func (s *pmService) MoveProjectTaskByKey(id, statusKey string, actorUserIDRaw in
 	if err != nil {
 		return nil, err
 	}
-	if err := s.Repository.MoveProjectTaskByKey(id, statusKey); err != nil {
+
+	// A parent task's status AND progress are always derived from its
+	// children on read (deriveParentStatus / leafProgressForStatus) —
+	// dragging one on the Kanban board (the UI should prevent this, but the
+	// backend is the actual source of truth) is a no-op on both stored
+	// columns rather than an error, consistent with how UpdateProjectTask
+	// silently drops a manual progress/status aimed at a parent.
+	childCount, err := s.Repository.ActiveChildTaskCount(id)
+	if err != nil {
 		return nil, err
 	}
+	if childCount == 0 {
+		if err := s.Repository.MoveProjectTaskByKey(id, statusKey); err != nil {
+			return nil, err
+		}
+		// Kanban drag never carries a manual progress value — apply the same
+		// leaf status rule table as everywhere else (to_do->0, in_progress->10
+		// only if it was 0, in_review->floor 90, done->100, blocked->unchanged).
+		newProgress := leafProgressForStatus(statusKey, progressPctFromRow(before["progress_pct"]), nil)
+		if err := s.Repository.UpdateProjectTask(id, map[string]interface{}{"progress_pct": newProgress}); err != nil {
+			return nil, err
+		}
+	}
+
 	after, err := s.Repository.ProjectTaskByID(id)
 	if err != nil {
 		return nil, err
 	}
 	actorUserID, actorName := s.resolveActor(actorUserIDRaw)
 	s.logTaskFieldChanges(id, before, after, actorUserID, actorName)
-	return after, nil
+
+	return s.attachEffectiveProgress(projectIDFromRow(after), after)
 }
 
 func (s *pmService) DeleteProjectTask(id string, actorUserIDRaw interface{}) error {
@@ -654,6 +807,426 @@ func (s *pmService) TaskActivityLogs(taskID string) ([]model.Row, error) {
 
 func (s *pmService) GanttMembers() ([]model.Row, error) {
 	return s.Repository.GanttMembers()
+}
+
+// ─── Work Timer (clock in/out) ─────────────────────────────────────────────
+
+// formatDurationShort renders seconds as a compact "1h 25m" label for
+// activity-log descriptions — mirrors the frontend's own duration formatter
+// so the log reads the same way the Work Logs panel displays it.
+func formatDurationShort(totalSeconds int64) string {
+	if totalSeconds < 60 {
+		return fmt.Sprintf("%ds", totalSeconds)
+	}
+	hours := totalSeconds / 3600
+	minutes := (totalSeconds % 3600) / 60
+	if hours == 0 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	return fmt.Sprintf("%dh %dm", hours, minutes)
+}
+
+func (s *pmService) ClockInTask(taskID string, userID int64, actorUserIDRaw interface{}) (model.Row, error) {
+	if !validUUID(taskID) {
+		return nil, fmt.Errorf("invalid task id")
+	}
+	if userID == 0 {
+		return nil, fmt.Errorf("userId is required")
+	}
+	task, err := s.Repository.ProjectTaskByID(taskID)
+	if err != nil {
+		return nil, err
+	}
+	projectID := projectIDFromRow(task)
+
+	row, err := s.Repository.ClockIn(taskID, userID, &projectID)
+	if err != nil {
+		if errors.Is(err, repository.ErrAlreadyClockedIn) {
+			return nil, s.describeAlreadyClockedIn(userID, err)
+		}
+		return nil, err
+	}
+
+	actorUserID, actorName := s.resolveActor(actorSource(map[string]interface{}{"actorUserId": actorUserIDRaw}, ""))
+	if actorUserID == nil {
+		actorUserID = &userID
+	}
+	if actorName == "" || actorName == "System" {
+		if name, nameErr := s.Repository.ResolveUserName(userID); nameErr == nil && name != "" {
+			actorName = name
+		}
+	}
+	s.logTaskActivity(taskID, projectID, actorUserID, actorName, "clock_in", "", nil, nil,
+		fmt.Sprintf("%s clocked in", actorName))
+
+	return row, nil
+}
+
+func (s *pmService) ClockOutTask(taskID string, userID int64, note *string, actorUserIDRaw interface{}) (model.Row, error) {
+	if !validUUID(taskID) {
+		return nil, fmt.Errorf("invalid task id")
+	}
+	if userID == 0 {
+		return nil, fmt.Errorf("userId is required")
+	}
+	row, err := s.Repository.ClockOut(taskID, userID, note)
+	if err != nil {
+		if errors.Is(err, repository.ErrNoActiveTimeLog) {
+			return nil, err
+		}
+		return nil, err
+	}
+
+	projectID := projectIDFromRow(row)
+	actorUserID, actorName := s.resolveActor(actorSource(map[string]interface{}{"actorUserId": actorUserIDRaw}, ""))
+	if actorUserID == nil {
+		actorUserID = &userID
+	}
+	if actorName == "" || actorName == "System" {
+		if name, nameErr := s.Repository.ResolveUserName(userID); nameErr == nil && name != "" {
+			actorName = name
+		}
+	}
+	duration, _ := toInt64(row["duration_seconds"])
+	s.logTaskActivity(taskID, projectID, actorUserID, actorName, "clock_out", "", nil, nil,
+		fmt.Sprintf("%s clocked out (%s)", actorName, formatDurationShort(duration)))
+
+	return row, nil
+}
+
+// TaskTimeLogs bundles the full session history for a task with the two
+// running totals the Work Logs panel needs (all-users total, this-user's
+// own total — both over CLOSED sessions only, since an open session's
+// duration isn't final yet) and, separately, the requesting user's own
+// still-open session on this task (if any), so the frontend can render the
+// running timer + Clock Out button without a second request.
+func (s *pmService) TaskTimeLogs(taskID string, userID int64) (model.Row, error) {
+	if !validUUID(taskID) {
+		return nil, fmt.Errorf("invalid task id")
+	}
+	logs, err := s.Repository.TimeLogsByTask(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	var totalDuration, myDuration int64
+	var activeLog model.Row
+	for _, log := range logs {
+		logUserID, _ := toInt64(log["user_id"])
+		if log["ended_at"] == nil {
+			if userID != 0 && logUserID == userID {
+				activeLog = log
+			}
+			continue
+		}
+		duration, _ := toInt64(log["duration_seconds"])
+		totalDuration += duration
+		if userID != 0 && logUserID == userID {
+			myDuration += duration
+		}
+	}
+
+	return model.Row{
+		"logs":                 logs,
+		"totalDurationSeconds": totalDuration,
+		"myDurationSeconds":    myDuration,
+		"activeLog":            activeLog,
+	}, nil
+}
+
+// ActiveTimeLogForUser answers "is this user clocked in anywhere right now",
+// enriched with the task's title/project so the frontend can render a
+// friendly "Clocked in on another task: <title>" message without a second
+// lookup.
+// elapsedSecondsFrom computes how long ago a DB-scanned timestamp column
+// (time.Time via database/sql) was, floored at 0 so clock skew between the
+// app server and DB never reports a negative running timer.
+func elapsedSecondsFrom(v interface{}) int64 {
+	t, ok := v.(time.Time)
+	if !ok {
+		return 0
+	}
+	elapsed := int64(time.Since(t).Seconds())
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
+}
+
+// ActiveTimeLogForUser answers "is this user clocked in anywhere right now"
+// as a flat, frontend-ready shape — {active:false} or {active:true, taskId,
+// taskTitle, taskType (task/subtask), parentTaskId/Title, projectId/Title,
+// startedAt, elapsedSeconds} — so the drawer/topbar can render "Clocked in
+// on another task: X" (and, for a subtask, name its parent) without a
+// second round trip.
+func (s *pmService) ActiveTimeLogForUser(userID int64) (model.Row, error) {
+	if userID == 0 {
+		return nil, fmt.Errorf("userId is required")
+	}
+	active, err := s.Repository.ActiveTimeLogForUser(userID)
+	if err != nil {
+		return nil, err
+	}
+	if active == nil {
+		return model.Row{"active": false}, nil
+	}
+
+	taskID := str(active["task_id"])
+	result := model.Row{
+		"active":         true,
+		"taskId":         taskID,
+		"startedAt":      active["started_at"],
+		"elapsedSeconds": elapsedSecondsFrom(active["started_at"]),
+	}
+
+	task, err := s.Repository.ProjectTaskByID(taskID)
+	if err != nil {
+		// Session row outlived its task somehow (shouldn't happen — tasks
+		// are soft-deleted, never hard-deleted) — still report the bare
+		// active session instead of erroring the whole check.
+		return result, nil
+	}
+	result["taskTitle"] = task["title"]
+
+	if parentTaskID := str(task["parent_task_id"]); parentTaskID != "" {
+		result["taskType"] = "subtask"
+		result["parentTaskId"] = parentTaskID
+		if parent, perr := s.Repository.ProjectTaskByID(parentTaskID); perr == nil {
+			result["parentTaskTitle"] = parent["title"]
+		}
+	} else {
+		result["taskType"] = "task"
+	}
+
+	crmProjectID := projectIDFromRow(task)
+	result["projectId"] = crmProjectID
+	if proj, perr := s.Repository.CrmProjectByID(crmProjectID); perr == nil {
+		result["projectTitle"] = proj["title"]
+	}
+
+	return result, nil
+}
+
+// timeFromRow reads a DB-scanned timestamp column as *time.Time — used when
+// falling back to an existing log's stored started_at/ended_at during a
+// partial manual-log edit.
+func timeFromRow(v interface{}) *time.Time {
+	t, ok := v.(time.Time)
+	if !ok {
+		return nil
+	}
+	return &t
+}
+
+// resolveManualLogActor is the shared "who's actually performing this
+// write, and what's their display name" resolution for all three manual-log
+// mutations — falls back to resolving userID's own name when no distinct
+// actor name comes back (e.g. actorUserId wasn't sent), same pattern
+// ClockInTask/ClockOutTask already use.
+func (s *pmService) resolveManualLogActor(actorUserIDRaw interface{}, fallbackUserID int64) (*int64, string) {
+	actorUserID, actorName := s.resolveActor(actorSource(map[string]interface{}{"actorUserId": actorUserIDRaw}, ""))
+	if actorUserID == nil {
+		actorUserID = &fallbackUserID
+	}
+	if actorName == "" || actorName == "System" {
+		if name, err := s.Repository.ResolveUserName(*actorUserID); err == nil && name != "" {
+			actorName = name
+		}
+	}
+	return actorUserID, actorName
+}
+
+// CreateManualTimeLog logs an already-closed session for the case the user
+// forgot to clock in/out — same table as ClockIn/ClockOut (source='manual'
+// instead of 'realtime'), but no "one active session" constraint applies
+// (that's specific to *open* sessions); it's checked instead for double-
+// booking against ANY of the user's existing sessions, open or closed, via
+// ManualLogOverlapExists.
+func (s *pmService) CreateManualTimeLog(taskID string, body map[string]interface{}, actorUserIDRaw interface{}) (model.Row, error) {
+	if !validUUID(taskID) {
+		return nil, fmt.Errorf("invalid task id")
+	}
+	userID := int64FromAny(body["userId"], 0)
+	if userID == 0 {
+		return nil, fmt.Errorf("userId is required")
+	}
+	note := strings.TrimSpace(strFromAny(body["note"], ""))
+	if note == "" {
+		return nil, fmt.Errorf("note is required for a manual log")
+	}
+	startedAt := parseDateTime(strPtrFromAny(body["startedAt"]))
+	endedAt := parseDateTime(strPtrFromAny(body["endedAt"]))
+	if startedAt == nil || endedAt == nil {
+		return nil, fmt.Errorf("startedAt and endedAt are required")
+	}
+	if !startedAt.Before(*endedAt) {
+		return nil, fmt.Errorf("startedAt must be before endedAt")
+	}
+
+	overlap, err := s.Repository.ManualLogOverlapExists(userID, *startedAt, *endedAt, nil)
+	if err != nil {
+		return nil, err
+	}
+	if overlap {
+		return nil, fmt.Errorf("this time range overlaps an existing log for this user")
+	}
+
+	task, err := s.Repository.ProjectTaskByID(taskID)
+	if err != nil {
+		return nil, err
+	}
+	projectID := projectIDFromRow(task)
+	duration := int64(endedAt.Sub(*startedAt).Seconds())
+
+	actorUserID, actorName := s.resolveManualLogActor(actorUserIDRaw, userID)
+	row, err := s.Repository.InsertManualTimeLog(map[string]interface{}{
+		"task_id":          taskID,
+		"project_id":       projectID,
+		"user_id":          userID,
+		"started_at":       *startedAt,
+		"ended_at":         *endedAt,
+		"duration_seconds": duration,
+		"note":             note,
+		"source":           "manual",
+		"created_by":       *actorUserID,
+		"updated_by":       *actorUserID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	desc := fmt.Sprintf("%s added a manual work log (%s)", actorName, formatDurationShort(duration))
+	if *actorUserID != userID {
+		if ownerName, nerr := s.Repository.ResolveUserName(userID); nerr == nil && ownerName != "" {
+			desc = fmt.Sprintf("%s added a manual work log for %s (%s)", actorName, ownerName, formatDurationShort(duration))
+		}
+	}
+	s.logTaskActivity(taskID, projectID, actorUserID, actorName, "manual_log_created", "", nil, nil, desc)
+
+	return row, nil
+}
+
+// UpdateManualTimeLog edits an existing manual log's time range/note/owner.
+// Only source='manual' rows are editable — a real-time session's
+// started_at/ended_at are a factual record of when the user actually
+// clocked in/out, not something to hand-edit after the fact.
+func (s *pmService) UpdateManualTimeLog(logID int64, body map[string]interface{}, actorUserIDRaw interface{}) (model.Row, error) {
+	before, err := s.Repository.TimeLogByID(logID)
+	if err != nil {
+		return nil, err
+	}
+	if str(before["source"]) != "manual" {
+		return nil, fmt.Errorf("only manual logs can be edited")
+	}
+
+	startedAt := parseDateTime(strPtrFromAny(body["startedAt"]))
+	endedAt := parseDateTime(strPtrFromAny(body["endedAt"]))
+	effectiveStart := startedAt
+	if effectiveStart == nil {
+		effectiveStart = timeFromRow(before["started_at"])
+	}
+	effectiveEnd := endedAt
+	if effectiveEnd == nil {
+		effectiveEnd = timeFromRow(before["ended_at"])
+	}
+	if effectiveStart == nil || effectiveEnd == nil {
+		return nil, fmt.Errorf("startedAt and endedAt are required")
+	}
+	if !effectiveStart.Before(*effectiveEnd) {
+		return nil, fmt.Errorf("startedAt must be before endedAt")
+	}
+
+	userID := int64FromAny(body["userId"], 0)
+	if userID == 0 {
+		userID, _ = toInt64(before["user_id"])
+	}
+
+	overlap, err := s.Repository.ManualLogOverlapExists(userID, *effectiveStart, *effectiveEnd, &logID)
+	if err != nil {
+		return nil, err
+	}
+	if overlap {
+		return nil, fmt.Errorf("this time range overlaps an existing log for this user")
+	}
+
+	fields := map[string]interface{}{}
+	if startedAt != nil {
+		fields["started_at"] = *startedAt
+	}
+	if endedAt != nil {
+		fields["ended_at"] = *endedAt
+	}
+	if startedAt != nil || endedAt != nil {
+		fields["duration_seconds"] = int64(effectiveEnd.Sub(*effectiveStart).Seconds())
+	}
+	if _, ok := body["userId"]; ok && userID > 0 {
+		fields["user_id"] = userID
+	}
+	if noteRaw, ok := body["note"]; ok {
+		note := strings.TrimSpace(strFromAny(noteRaw, ""))
+		if note == "" {
+			return nil, fmt.Errorf("note is required for a manual log")
+		}
+		fields["note"] = note
+	}
+
+	actorUserID, actorName := s.resolveManualLogActor(actorUserIDRaw, userID)
+	fields["updated_by"] = *actorUserID
+
+	if len(fields) > 0 {
+		if err := s.Repository.UpdateTimeLog(logID, fields); err != nil {
+			return nil, err
+		}
+	}
+	after, err := s.Repository.TimeLogByID(logID)
+	if err != nil {
+		return nil, err
+	}
+
+	taskID := str(after["task_id"])
+	projectID := projectIDFromRow(after)
+	s.logTaskActivity(taskID, projectID, actorUserID, actorName, "manual_log_updated", "", nil, nil,
+		fmt.Sprintf("%s updated a manual work log", actorName))
+
+	return after, nil
+}
+
+// DeleteManualTimeLog soft-deletes a manual log. Real-time (clock in/out)
+// sessions have no delete endpoint wired to them — this only ever operates
+// on source='manual' rows.
+func (s *pmService) DeleteManualTimeLog(logID int64, actorUserIDRaw interface{}) error {
+	before, err := s.Repository.TimeLogByID(logID)
+	if err != nil {
+		return err
+	}
+	if str(before["source"]) != "manual" {
+		return fmt.Errorf("only manual logs can be deleted")
+	}
+	if err := s.Repository.DeleteTimeLog(logID); err != nil {
+		return err
+	}
+
+	ownerID, _ := toInt64(before["user_id"])
+	actorUserID, actorName := s.resolveManualLogActor(actorUserIDRaw, ownerID)
+	s.logTaskActivity(str(before["task_id"]), projectIDFromRow(before), actorUserID, actorName, "manual_log_deleted", "", nil, nil,
+		fmt.Sprintf("%s deleted a manual work log", actorName))
+	return nil
+}
+
+// describeAlreadyClockedIn turns the bare ErrAlreadyClockedIn into a message
+// naming the task the user is already on, when that can be resolved —
+// falls back to the generic error if the lookup itself fails for any reason
+// (never let a best-effort enrichment mask the real 409).
+func (s *pmService) describeAlreadyClockedIn(userID int64, fallback error) error {
+	active, err := s.Repository.ActiveTimeLogForUser(userID)
+	if err != nil || active == nil {
+		return fallback
+	}
+	task, err := s.Repository.ProjectTaskByID(str(active["task_id"]))
+	if err != nil || task["title"] == nil {
+		return fallback
+	}
+	return fmt.Errorf("already clocked in on \"%s\" — clock out there first: %w", str(task["title"]), fallback)
 }
 
 func periodRange(period string) (*string, *string) {
@@ -737,6 +1310,775 @@ func (s *pmService) UpdateTimesheetStatus(id int64, status string, approvedBy *i
 
 func (s *pmService) DeleteTimesheet(id int64) error {
 	return s.Repository.DeleteTimesheet(id)
+}
+
+// ─── PM Dashboard summary (/v1/pm/dashboard/summary) ───────────────────────
+//
+// High-level portfolio monitoring for /pm/dashboard. Every number here is
+// derived from PmPortfolioProjects/PmPortfolioTasks/PmActiveWorkSessions/
+// PmWeeklySecondsByUser/PmMembersForWorkload/PmRecentActivity — no field is
+// ever hardcoded or estimated without a documented rule. Response is a plain
+// model.Row (matching every other PM endpoint's convention) built with the
+// exact key names the frontend contract expects (see CLAUDE.md).
+//
+// Stage is read straight off PmPortfolioProjects' `stage` column (the same
+// taskStageCaseSQL CASE used by CrmProjects/CrmProjectByID) — never
+// re-derived here, so /pm/dashboard and /pm/projects can never disagree on
+// a project's Stage. "In Progress" was previously labeled "Fieldwork";
+// taskStageCaseSQL already only ever emits "In Progress" (see the 2026-07-22
+// rename note on that const) so no normalization is needed on this side.
+//
+// Planned progress is new (no prior metric in this codebase derives it): the
+// percentage of a project's plan_start->plan_end window that has elapsed as
+// of now, clamped 0-100. A project with no plan window at all (brand new,
+// no tasks, no CRM start/end dates) reports 0 rather than being excluded,
+// so portfolio averages still divide by every project consistently.
+//
+// Actual progress reuses computeTaskProgress/projectProgressFromTasks
+// verbatim (the same helpers CrmProjects/CrmProjectDetail/TasksByCrmProject
+// use) — the single source of truth for "how much of this project's active
+// work is actually done".
+func (s *pmService) DashboardSummary() (model.Row, error) {
+	projects, err := s.Repository.PmPortfolioProjects()
+	if err != nil {
+		return nil, err
+	}
+	tasks, err := s.Repository.PmPortfolioTasks()
+	if err != nil {
+		tasks = []model.Row{}
+	}
+	members, err := s.Repository.PmMembersForWorkload()
+	if err != nil {
+		members = []model.Row{}
+	}
+	// Graceful fallback per the backend requirements: if the time-log or
+	// activity-log tables/queries are ever unavailable, the dashboard still
+	// renders with zeroed/empty sections instead of a hard 500.
+	activeSessions, err := s.Repository.PmActiveWorkSessions()
+	if err != nil {
+		activeSessions = []model.Row{}
+	}
+	weeklySeconds, err := s.Repository.PmWeeklySecondsByUser()
+	if err != nil {
+		weeklySeconds = []model.Row{}
+	}
+	recentActivity, err := s.Repository.PmRecentActivity(10)
+	if err != nil {
+		recentActivity = []model.Row{}
+	}
+
+	now := time.Now()
+
+	// Only PM-portfolio (Advisory/Audit Program) projects' own tasks count
+	// toward stage/health/progress/attention — a task somehow pointing at a
+	// crm_project_id outside that scope (shouldn't happen, but PmPortfolioTasks
+	// is intentionally unscoped for reuse) never leaks into these metrics.
+	scopedProjectIDs := make(map[int64]bool, len(projects))
+	projectTitleByID := make(map[int64]string, len(projects))
+	for _, p := range projects {
+		pid, _ := toInt64(p["crm_project_id"])
+		scopedProjectIDs[pid] = true
+		projectTitleByID[pid] = str(p["title"])
+	}
+
+	tasksByProject := make(map[int64][]model.Row, len(projects))
+	for _, t := range tasks {
+		pid, _ := toInt64(t["crm_project_id"])
+		if !scopedProjectIDs[pid] {
+			continue
+		}
+		tasksByProject[pid] = append(tasksByProject[pid], t)
+	}
+
+	// weeklySecondsByUser / activeSessionByUser index the two time-log
+	// queries by user id — activeSessions is guaranteed at-most-one-per-user
+	// by the DB's unique partial index (migration 013), so a plain map
+	// assignment (not append) is safe.
+	weeklySecondsByUser := make(map[int64]int64, len(weeklySeconds))
+	for _, row := range weeklySeconds {
+		uid, _ := toInt64(row["user_id"])
+		seconds, _ := toInt64(row["total_seconds"])
+		weeklySecondsByUser[uid] = seconds
+	}
+	activeSessionByUser := make(map[int64]model.Row, len(activeSessions))
+	for _, row := range activeSessions {
+		uid, _ := toInt64(row["user_id"])
+		activeSessionByUser[uid] = row
+	}
+
+	type projectMetrics struct {
+		row              model.Row
+		stage            string
+		health           string
+		actualProgress   int64
+		plannedProgress  int64
+		overdueTaskCount int64
+		issue            string
+		issueRank        int
+	}
+
+	metrics := make([]projectMetrics, 0, len(projects))
+	var totalOpenTasks, totalDoneTasksAllProjects, totalTasksAllProjects int64
+	var sumPlanned, sumActual int64
+
+	for _, p := range projects {
+		pid, _ := toInt64(p["crm_project_id"])
+		projectTasks := tasksByProject[pid]
+
+		stage := str(p["stage"])
+		blockedTasks, _ := toInt64(p["blocked_tasks"])
+		totalTasks, _ := toInt64(p["total_tasks"])
+		doneTasks, _ := toInt64(p["done_tasks"])
+
+		progress := computeTaskProgress(projectTasks)
+		actualProgress := projectProgressFromTasks(projectTasks, progress)
+		plannedProgress := planProgressPercent(timeFromRow(p["plan_start"]), timeFromRow(p["plan_end"]), now)
+
+		var overdueTaskCount int64
+		for _, t := range projectTasks {
+			if isOverdueTask(t, now) {
+				overdueTaskCount++
+			}
+			if normalizeTaskStatusKey(str(t["status"])) != "done" {
+				totalOpenTasks++
+			}
+		}
+		totalDoneTasksAllProjects += doneTasks
+		totalTasksAllProjects += totalTasks
+		sumPlanned += plannedProgress
+		sumActual += actualProgress
+
+		planEndPassed := false
+		if planEnd := timeFromRow(p["plan_end"]); planEnd != nil && isPastCalendarDay(*planEnd, now) {
+			planEndPassed = true
+		}
+
+		health := "Healthy"
+		switch {
+		case blockedTasks > 0 || stage == "Blocked":
+			health = "Blocked"
+		case overdueTaskCount > 0 || (planEndPassed && stage != "Completed") || actualProgress < plannedProgress:
+			health = "At Risk"
+		}
+
+		// Issue priority for Attention Needed: Blocked > Overdue > Behind
+		// plan > No recent update. Only one issue is surfaced per project
+		// (the most critical applicable one) — a project can technically
+		// match more than one, but showing the single worst signal is what
+		// keeps the table scannable.
+		issue, issueRank := "", -1
+		updatedAt := timeFromRow(p["updated_at"])
+		staleUpdate := updatedAt != nil && now.Sub(*updatedAt) > 14*24*time.Hour
+		switch {
+		case blockedTasks > 0 || stage == "Blocked":
+			issue, issueRank = "Blocked", 0
+		case overdueTaskCount > 0 || (planEndPassed && stage != "Completed"):
+			issue, issueRank = "Overdue", 1
+		case actualProgress < plannedProgress && stage != "Completed":
+			issue, issueRank = "Behind plan", 2
+		case staleUpdate && stage != "Completed":
+			issue, issueRank = "No recent update", 3
+		}
+
+		metrics = append(metrics, projectMetrics{
+			row: p, stage: stage, health: health,
+			actualProgress: actualProgress, plannedProgress: plannedProgress,
+			overdueTaskCount: overdueTaskCount, issue: issue, issueRank: issueRank,
+		})
+	}
+
+	// ── Summary cards ──────────────────────────────────────────────────
+	var activeProjects, completedProjects, blockedProjects, overdueProjects int64
+	peopleSet := map[int64]bool{}
+	for _, t := range tasks {
+		pid, _ := toInt64(t["crm_project_id"])
+		if !scopedProjectIDs[pid] {
+			continue
+		}
+		if uid, ok := toInt64(t["assigned_to"]); ok && uid != 0 {
+			peopleSet[uid] = true
+		}
+	}
+	for _, m := range metrics {
+		switch m.stage {
+		case "Completed":
+			completedProjects++
+		case "Blocked":
+			blockedProjects++
+		default:
+			activeProjects++
+		}
+		if m.overdueTaskCount > 0 || m.issue == "Overdue" {
+			overdueProjects++
+		}
+	}
+	var totalWeeklySeconds int64
+	for _, seconds := range weeklySecondsByUser {
+		totalWeeklySeconds += seconds
+	}
+
+	summary := model.Row{
+		"totalProjects":     int64(len(projects)),
+		"activeProjects":    activeProjects,
+		"completedProjects": completedProjects,
+		"blockedProjects":   blockedProjects,
+		"overdueProjects":   overdueProjects,
+		"totalOpenTasks":    totalOpenTasks,
+		"peopleInvolved":    int64(len(peopleSet)),
+		"workHoursThisWeek": roundTo1(float64(totalWeeklySeconds) / 3600.0),
+	}
+
+	// ── Stage / Health overview ────────────────────────────────────────
+	stageCounts := map[string]int64{"Planning": 0, "In Progress": 0, "Review": 0, "Blocked": 0, "Completed": 0}
+	healthCounts := map[string]int64{"Healthy": 0, "At Risk": 0, "Blocked": 0}
+	for _, m := range metrics {
+		if _, ok := stageCounts[m.stage]; ok {
+			stageCounts[m.stage]++
+		}
+		healthCounts[m.health]++
+	}
+	stageOrder := []string{"Planning", "In Progress", "Review", "Blocked", "Completed"}
+	stageOverview := make([]model.Row, 0, len(stageOrder))
+	for _, st := range stageOrder {
+		stageOverview = append(stageOverview, model.Row{"stage": st, "count": stageCounts[st]})
+	}
+	healthOrder := []string{"Healthy", "At Risk", "Blocked"}
+	healthOverview := make([]model.Row, 0, len(healthOrder))
+	for _, h := range healthOrder {
+		healthOverview = append(healthOverview, model.Row{"health": h, "count": healthCounts[h]})
+	}
+
+	// ── Portfolio progress ─────────────────────────────────────────────
+	var avgPlanned, avgActual float64
+	if len(metrics) > 0 {
+		avgPlanned = float64(sumPlanned) / float64(len(metrics))
+		avgActual = float64(sumActual) / float64(len(metrics))
+	}
+	portfolioProgress := model.Row{
+		"averagePlannedProgress": roundTo1(avgPlanned),
+		"averageActualProgress":  roundTo1(avgActual),
+		"averageVariance":        roundTo1(avgActual - avgPlanned),
+		"completedTasks":         totalDoneTasksAllProjects,
+		"totalTasks":             totalTasksAllProjects,
+	}
+
+	// ── Attention Needed (top 10, most critical first) ─────────────────
+	attention := make([]projectMetrics, 0, len(metrics))
+	for _, m := range metrics {
+		if m.issue != "" {
+			attention = append(attention, m)
+		}
+	}
+	sort.SliceStable(attention, func(i, j int) bool { return attention[i].issueRank < attention[j].issueRank })
+	if len(attention) > 10 {
+		attention = attention[:10]
+	}
+	attentionNeeded := make([]model.Row, 0, len(attention))
+	for _, m := range attention {
+		pid, _ := toInt64(m.row["crm_project_id"])
+		attentionNeeded = append(attentionNeeded, model.Row{
+			"projectId":    pid,
+			"projectTitle": m.row["title"],
+			"picName":      strFromAny(m.row["pic"], strFromAny(m.row["owner"], strFromAny(m.row["owner_name"], ""))),
+			"stage":        m.stage,
+			"progress":     m.actualProgress,
+			"deadline":     m.row["plan_end"],
+			"issue":        m.issue,
+		})
+	}
+
+	// ── Team workload ───────────────────────────────────────────────────
+	tasksByUser := make(map[int64][]model.Row, len(members))
+	for _, t := range tasks {
+		uid, ok := toInt64(t["assigned_to"])
+		if !ok || uid == 0 {
+			continue
+		}
+		tasksByUser[uid] = append(tasksByUser[uid], t)
+	}
+	teamWorkload := make([]model.Row, 0, len(members))
+	for _, member := range members {
+		uid, _ := toInt64(member["id"])
+		userTasks := tasksByUser[uid]
+		var active, inProgress, overdue int64
+		for _, t := range userTasks {
+			statusKey := normalizeTaskStatusKey(str(t["status"]))
+			if statusKey != "done" {
+				active++
+			}
+			if statusKey == "in_progress" {
+				inProgress++
+			}
+			if isOverdueTask(t, now) {
+				overdue++
+			}
+		}
+		hoursThisWeek := roundTo1(float64(weeklySecondsByUser[uid]) / 3600.0)
+
+		var currentClockIn interface{}
+		if session, ok := activeSessionByUser[uid]; ok {
+			taskType := "task"
+			if toBool(session["is_subtask"]) {
+				taskType = "subtask"
+			}
+			spid, _ := toInt64(session["project_id"])
+			currentClockIn = model.Row{
+				"taskId":       session["task_id"],
+				"taskTitle":    session["task_title"],
+				"projectId":    spid,
+				"projectTitle": session["project_title"],
+				"startedAt":    session["started_at"],
+				"taskType":     taskType,
+			}
+		}
+
+		teamWorkload = append(teamWorkload, model.Row{
+			"userId":          uid,
+			"memberName":      member["name"],
+			"jobTitle":        strFromAny(member["job_title"], ""),
+			"activeTasks":     active,
+			"inProgressTasks": inProgress,
+			"overdueTasks":    overdue,
+			"hoursThisWeek":   hoursThisWeek,
+			"currentClockIn":  currentClockIn,
+			"loadStatus":      loadStatus(active, overdue, hoursThisWeek),
+		})
+	}
+
+	// ── Active work sessions ────────────────────────────────────────────
+	activeWorkSessions := make([]model.Row, 0, len(activeSessions))
+	for _, session := range activeSessions {
+		uid, _ := toInt64(session["user_id"])
+		pid, _ := toInt64(session["project_id"])
+		taskType := "task"
+		if toBool(session["is_subtask"]) {
+			taskType = "subtask"
+		}
+		activeWorkSessions = append(activeWorkSessions, model.Row{
+			"userId":         uid,
+			"memberName":     session["member_name"],
+			"projectId":      pid,
+			"projectTitle":   session["project_title"],
+			"taskId":         session["task_id"],
+			"taskTitle":      session["task_title"],
+			"taskType":       taskType,
+			"startedAt":      session["started_at"],
+			"elapsedSeconds": elapsedSecondsFrom(session["started_at"]),
+		})
+	}
+
+	// ── Upcoming deadlines (tasks only; capped at 15) ──────────────────
+	type deadlineItem struct {
+		row    model.Row
+		due    time.Time
+		status string
+		rank   int
+	}
+	deadlineItems := make([]deadlineItem, 0)
+	weekFromNow := now.Add(7 * 24 * time.Hour)
+	for _, t := range tasks {
+		if normalizeTaskStatusKey(str(t["status"])) == "done" {
+			continue
+		}
+		due := timeFromRow(t["deadline"])
+		if due == nil {
+			continue
+		}
+		var status string
+		var rank int
+		switch {
+		case isPastCalendarDay(*due, now):
+			status, rank = "Overdue", 0
+		case isSameCalendarDay(*due, now):
+			status, rank = "Due Today", 1
+		case due.Before(weekFromNow):
+			status, rank = "Due This Week", 2
+		default:
+			continue
+		}
+		deadlineItems = append(deadlineItems, deadlineItem{row: t, due: *due, status: status, rank: rank})
+	}
+	sort.SliceStable(deadlineItems, func(i, j int) bool {
+		if deadlineItems[i].rank != deadlineItems[j].rank {
+			return deadlineItems[i].rank < deadlineItems[j].rank
+		}
+		return deadlineItems[i].due.Before(deadlineItems[j].due)
+	})
+	if len(deadlineItems) > 15 {
+		deadlineItems = deadlineItems[:15]
+	}
+	upcomingDeadlines := make([]model.Row, 0, len(deadlineItems))
+	for _, d := range deadlineItems {
+		pid, _ := toInt64(d.row["crm_project_id"])
+		itemType := "task"
+		if str(d.row["parent_task_id"]) != "" {
+			itemType = "subtask"
+		}
+		upcomingDeadlines = append(upcomingDeadlines, model.Row{
+			"type":         itemType,
+			"itemId":       d.row["id"],
+			"itemTitle":    d.row["title"],
+			"projectId":    pid,
+			"projectTitle": projectTitleByID[pid],
+			"ownerName":    strFromAny(d.row["assignee_name"], ""),
+			"dueDate":      d.row["deadline"],
+			"status":       d.status,
+		})
+	}
+
+	// ── Recent activity ────────────────────────────────────────────────
+	recent := make([]model.Row, 0, len(recentActivity))
+	for _, a := range recentActivity {
+		pid, _ := toInt64(a["project_id"])
+		recent = append(recent, model.Row{
+			"id":          a["id"],
+			"actorName":   strFromAny(a["actor_name"], "System"),
+			"action":      a["action"],
+			"description": a["description"],
+			"projectId":   pid,
+			"taskId":      a["task_id"],
+			"createdAt":   a["created_at"],
+		})
+	}
+
+	return model.Row{
+		"summary":            summary,
+		"stageOverview":      stageOverview,
+		"healthOverview":     healthOverview,
+		"portfolioProgress":  portfolioProgress,
+		"attentionNeeded":    attentionNeeded,
+		"teamWorkload":       teamWorkload,
+		"activeWorkSessions": activeWorkSessions,
+		"upcomingDeadlines":  upcomingDeadlines,
+		"recentActivity":     recent,
+	}, nil
+}
+
+// ─── Team Workload period filter (/v1/pm/dashboard/team-workload) ─────────
+//
+// TeamWorkloadByPeriod is DashboardSummary's teamWorkload section, widened
+// to accept a period instead of always being the current calendar week —
+// see CLAUDE.md for the full requirements writeup. Per-member fields and
+// their period-sensitivity (also documented in CLAUDE.md):
+//   - activeTasks / inProgressTasks / overdueTasks / currentClockIn: always
+//     CURRENT snapshot, never historical — the task explicitly asked for
+//     this ("agar dashboard tetap actionable"): "how much is on this
+//     person's plate right now" doesn't make sense as a stale July number
+//     while looking at a June report.
+//   - completedTasks / hoursLogged / averageHoursPerDay: scoped to the
+//     selected period.
+//   - loadStatus: uses the period's hoursLogged against weekly or monthly
+//     thresholds depending on periodKind (see loadStatusForPeriod).
+func (s *pmService) TeamWorkloadByPeriod(periodType, monthParam string) (model.Row, error) {
+	now := time.Now()
+	start, end, label, periodKind, isOngoing, err := resolvePeriodRange(periodType, monthParam, now)
+	if err != nil {
+		return nil, err
+	}
+
+	members, err := s.Repository.PmMembersForWorkload()
+	if err != nil {
+		members = []model.Row{}
+	}
+	tasks, err := s.Repository.PmPortfolioTasks()
+	if err != nil {
+		tasks = []model.Row{}
+	}
+	activeSessions, err := s.Repository.PmActiveWorkSessions()
+	if err != nil {
+		activeSessions = []model.Row{}
+	}
+	periodSeconds, err := s.Repository.PmWorkloadSecondsByUserForRange(start, end)
+	if err != nil {
+		periodSeconds = []model.Row{}
+	}
+	periodCompleted, err := s.Repository.PmCompletedTasksByUserForRange(start, end)
+	if err != nil {
+		periodCompleted = []model.Row{}
+	}
+
+	tasksByUser := make(map[int64][]model.Row, len(members))
+	for _, t := range tasks {
+		uid, ok := toInt64(t["assigned_to"])
+		if !ok || uid == 0 {
+			continue
+		}
+		tasksByUser[uid] = append(tasksByUser[uid], t)
+	}
+	secondsByUser := make(map[int64]int64, len(periodSeconds))
+	for _, row := range periodSeconds {
+		uid, _ := toInt64(row["user_id"])
+		seconds, _ := toInt64(row["period_seconds"])
+		secondsByUser[uid] = seconds
+	}
+	completedByUser := make(map[int64]int64, len(periodCompleted))
+	for _, row := range periodCompleted {
+		uid, _ := toInt64(row["user_id"])
+		count, _ := toInt64(row["completed_tasks"])
+		completedByUser[uid] = count
+	}
+	activeSessionByUser := make(map[int64]model.Row, len(activeSessions))
+	for _, row := range activeSessions {
+		uid, _ := toInt64(row["user_id"])
+		activeSessionByUser[uid] = row
+	}
+
+	// workdaysElapsed: for a period still in progress (isOngoing), count
+	// Mon-Fri only up to and including today; for a fully-elapsed past
+	// custom_month, count every weekday in the whole month (`end` is
+	// already the exclusive month boundary in that case, so no `now` cap
+	// is needed).
+	workdaysEndExclusive := end
+	if isOngoing {
+		workdaysEndExclusive = now.AddDate(0, 0, 1)
+	}
+	workdaysElapsed := countWeekdays(start, workdaysEndExclusive)
+
+	teamWorkload := make([]model.Row, 0, len(members))
+	for _, member := range members {
+		uid, _ := toInt64(member["id"])
+		userTasks := tasksByUser[uid]
+		var active, inProgress, overdue int64
+		for _, t := range userTasks {
+			statusKey := normalizeTaskStatusKey(str(t["status"]))
+			if statusKey != "done" {
+				active++
+			}
+			if statusKey == "in_progress" {
+				inProgress++
+			}
+			if isOverdueTask(t, now) {
+				overdue++
+			}
+		}
+
+		periodHours := roundTo1(float64(secondsByUser[uid]) / 3600.0)
+		var avgHoursPerDay float64
+		if workdaysElapsed > 0 {
+			avgHoursPerDay = roundTo1(periodHours / float64(workdaysElapsed))
+		}
+
+		var currentClockIn interface{}
+		if session, ok := activeSessionByUser[uid]; ok {
+			taskType := "task"
+			if toBool(session["is_subtask"]) {
+				taskType = "subtask"
+			}
+			spid, _ := toInt64(session["project_id"])
+			currentClockIn = model.Row{
+				"taskId":       session["task_id"],
+				"taskTitle":    session["task_title"],
+				"projectId":    spid,
+				"projectTitle": session["project_title"],
+				"startedAt":    session["started_at"],
+				"taskType":     taskType,
+			}
+		}
+
+		teamWorkload = append(teamWorkload, model.Row{
+			"userId":          uid,
+			"memberName":      member["name"],
+			"jobTitle":        strFromAny(member["job_title"], ""),
+			"activeTasks":     active,
+			"inProgressTasks": inProgress,
+			"completedTasks":  completedByUser[uid],
+			"overdueTasks":    overdue,
+			"hoursLogged":     periodHours,
+			"avgHoursPerDay":  avgHoursPerDay,
+			"currentClockIn":  currentClockIn,
+			"loadStatus":      loadStatusForPeriod(active, overdue, periodHours, periodKind),
+		})
+	}
+
+	return model.Row{
+		"period": model.Row{
+			"type":            periodType,
+			"label":           label,
+			"startDate":       start,
+			"endDate":         end,
+			"workdaysElapsed": workdaysElapsed,
+		},
+		"teamWorkload": teamWorkload,
+	}, nil
+}
+
+// resolvePeriodRange turns a period type (+ optional YYYY-MM month for
+// custom_month) into a concrete [start, end) query range, a display label,
+// whether monthly or weekly loadStatus thresholds apply, and whether the
+// period is still "ongoing" (end == now, so workday-elapsed counting should
+// stop at today) vs a fully-elapsed past (or, edge case, future) month.
+//   - this_week: Monday 00:00 of the current week -> now. Always ongoing.
+//   - this_month: the 1st of the current month 00:00 -> now. Always ongoing.
+//   - custom_month: the 1st of the requested month 00:00 -> either `now`
+//     (ongoing, if the requested month IS the current month) or the 1st of
+//     the FOLLOWING month (not ongoing — a past, or edge-case future, month
+//     is treated as fully elapsed), i.e. the full calendar month.
+func resolvePeriodRange(periodType, monthParam string, now time.Time) (start, end time.Time, label, periodKind string, isOngoing bool, err error) {
+	switch periodType {
+	case "", "this_week":
+		start = startOfWeek(now)
+		end = now
+		label = "This Week"
+		periodKind = "weekly"
+		isOngoing = true
+	case "this_month":
+		start = startOfMonth(now)
+		end = now
+		label = now.Format("January 2006")
+		periodKind = "monthly"
+		isOngoing = true
+	case "custom_month":
+		if strings.TrimSpace(monthParam) == "" {
+			return start, end, "", "", false, fmt.Errorf("%w: month is required for custom_month period (format YYYY-MM)", ErrInvalidWorkloadPeriod)
+		}
+		parsed, perr := time.ParseInLocation("2006-01", monthParam, now.Location())
+		if perr != nil {
+			return start, end, "", "", false, fmt.Errorf("%w: invalid month %q, expected YYYY-MM", ErrInvalidWorkloadPeriod, monthParam)
+		}
+		start = time.Date(parsed.Year(), parsed.Month(), 1, 0, 0, 0, 0, now.Location())
+		nextMonth := start.AddDate(0, 1, 0)
+		if start.Year() == now.Year() && start.Month() == now.Month() {
+			end = now
+			isOngoing = true
+		} else {
+			end = nextMonth
+			isOngoing = false
+		}
+		label = start.Format("January 2006")
+		periodKind = "monthly"
+	default:
+		return start, end, "", "", false, fmt.Errorf("%w: unknown period %q (expected this_week, this_month, or custom_month)", ErrInvalidWorkloadPeriod, periodType)
+	}
+	return start, end, label, periodKind, isOngoing, nil
+}
+
+// startOfWeek returns Monday 00:00 of t's ISO week (Mon-Fri are the only
+// days that ever count as "workdays" in this feature).
+func startOfWeek(t time.Time) time.Time {
+	daysSinceMonday := (int(t.Weekday()) + 6) % 7 // Sunday=0 -> 6, Monday=1 -> 0, ...
+	d := t.AddDate(0, 0, -daysSinceMonday)
+	return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, t.Location())
+}
+
+func startOfMonth(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location())
+}
+
+// countWeekdays counts Mon-Fri calendar days in [startInclusive, endExclusive).
+func countWeekdays(startInclusive, endExclusive time.Time) int {
+	d := time.Date(startInclusive.Year(), startInclusive.Month(), startInclusive.Day(), 0, 0, 0, 0, startInclusive.Location())
+	endDay := time.Date(endExclusive.Year(), endExclusive.Month(), endExclusive.Day(), 0, 0, 0, 0, endExclusive.Location())
+	count := 0
+	for d.Before(endDay) {
+		if wd := d.Weekday(); wd != time.Saturday && wd != time.Sunday {
+			count++
+		}
+		d = d.AddDate(0, 0, 1)
+	}
+	return count
+}
+
+// loadStatusForPeriod is loadStatus's period-aware sibling — same priority
+// order (heaviest signal wins, checked first), but the hours thresholds
+// scale with periodKind ("weekly" thresholds for this_week; "monthly" —
+// roughly 4x — for this_month/custom_month, per the task's explicit rule
+// table). Deliberately a separate function from loadStatus (used by
+// DashboardSummary, always weekly) rather than a shared one with a bypass
+// flag — keeps the always-weekly summary card path simple and unable to
+// accidentally regress if this one changes.
+func loadStatusForPeriod(activeTasks, overdueTasks int64, hoursLogged float64, periodKind string) string {
+	heavyHours, moderateHours := 35.0, 20.0
+	if periodKind == "monthly" {
+		heavyHours, moderateHours = 140.0, 80.0
+	}
+	switch {
+	case activeTasks > 5 || hoursLogged > heavyHours || overdueTasks > 0:
+		return "Berat"
+	case activeTasks >= 3 || hoursLogged >= moderateHours:
+		return "Sedang"
+	default:
+		return "Ringan"
+	}
+}
+
+// planProgressPercent is the "planned progress" side of Portfolio Progress:
+// how far through a project's plan_start->plan_end window `now` falls,
+// clamped 0-100. Returns 0 if either bound is missing or the window is
+// zero/negative-length (can't divide by zero, and a same-day plan window
+// isn't meaningful to interpolate) — a project with no usable plan window
+// simply contributes 0 rather than being excluded from portfolio averages.
+func planProgressPercent(planStart, planEnd *time.Time, now time.Time) int64 {
+	if planStart == nil || planEnd == nil {
+		return 0
+	}
+	total := planEnd.Sub(*planStart)
+	if total <= 0 {
+		return 0
+	}
+	if now.Before(*planStart) {
+		return 0
+	}
+	if !now.Before(*planEnd) {
+		return 100
+	}
+	elapsed := now.Sub(*planStart)
+	pct := int64((elapsed.Seconds() / total.Seconds()) * 100)
+	return clampPercent(pct)
+}
+
+// isOverdueTask: has a deadline whose calendar day has already fully passed
+// and isn't done yet. Mirrors the LOWER(status) tolerance taskStageJoinSQL
+// uses elsewhere in this file, via normalizeTaskStatusKey (folds 'completed'
+// into 'done'). Calendar-day (not exact-timestamp) comparison matters
+// because task deadlines are stored as midnight-of-day values — an exact
+// due.Before(now) would flag a task as "overdue" the instant any time at
+// all has passed today, making "Due Today" effectively unreachable.
+func isOverdueTask(t model.Row, now time.Time) bool {
+	if normalizeTaskStatusKey(str(t["status"])) == "done" {
+		return false
+	}
+	due := timeFromRow(t["deadline"])
+	return due != nil && isPastCalendarDay(*due, now)
+}
+
+// isPastCalendarDay/isSameCalendarDay compare only the Y/M/D of two
+// timestamps (ignoring time-of-day) — see isOverdueTask's doc comment for
+// why this matters given midnight-stored deadlines.
+func isPastCalendarDay(t, now time.Time) bool {
+	ty, tm, td := t.Date()
+	ny, nm, nd := now.Date()
+	if ty != ny {
+		return ty < ny
+	}
+	if tm != nm {
+		return tm < nm
+	}
+	return td < nd
+}
+
+func isSameCalendarDay(t, now time.Time) bool {
+	ty, tm, td := t.Date()
+	ny, nm, nd := now.Date()
+	return ty == ny && tm == nm && td == nd
+}
+
+// loadStatus implements the dashboard's initial Team Workload thresholds
+// (Ringan/Sedang/Berat), checked heaviest-first so any single qualifying
+// condition is enough to escalate — e.g. zero active tasks but 40 tracked
+// hours this week (a big single task) still reports Berat.
+func loadStatus(activeTasks, overdueTasks int64, hoursThisWeek float64) string {
+	switch {
+	case activeTasks > 5 || hoursThisWeek > 35 || overdueTasks > 0:
+		return "Berat"
+	case activeTasks >= 3 || hoursThisWeek >= 20:
+		return "Sedang"
+	default:
+		return "Ringan"
+	}
+}
+
+func roundTo1(v float64) float64 {
+	return math.Round(v*10) / 10
 }
 
 func strFromAny(v interface{}, fallback string) string {
@@ -879,10 +2221,292 @@ func toInt64(v interface{}) (int64, bool) {
 		return n, true
 	case int32:
 		return int64(n), true
+	case int16:
+		// Postgres smallint columns (e.g. pm_project_tasks.progress_pct)
+		// scan into map[string]interface{} as Go int16, not int64/int32 —
+		// confirmed via runtime type check, not assumption.
+		return int64(n), true
 	case int:
 		return int64(n), true
 	}
 	return 0, false
+}
+
+// ─── Task/project progress computation (single source of truth) ───────────
+//
+// Effective progress is never trusted purely from the stored progress_pct
+// column — it's recomputed on every read from status + child tasks, so a
+// row written before this feature shipped (or edited any other way) always
+// self-corrects instead of showing a stale number. See CrmProjectDetail,
+// CrmProjects, TasksByCrmProject, and the task write paths (CreateTask/
+// UpdateTask/MoveTaskByKey below) for where this plugs in.
+
+// taskProgress holds one task's derived effective progress/status plus
+// whether it has any active direct subtasks. A task with subtasks is a
+// "parent": its progress AND status are always derived from its children,
+// never a manual value — see leafProgressForStatus (progress) and
+// deriveParentStatus (status) for the two rule tables.
+type taskProgress struct {
+	Progress int64
+	Status   string // normalized key: to_do/in_progress/in_review/blocked/done
+	IsParent bool
+}
+
+// normalizeTaskStatusKey lowercases/trims a raw status value and folds
+// 'completed' into 'done' — the one place both leafProgressForStatus and
+// deriveParentStatus agree on what a status string actually means.
+func normalizeTaskStatusKey(raw string) string {
+	key := strings.ToLower(strings.TrimSpace(raw))
+	if key == "completed" {
+		return "done"
+	}
+	if key == "" {
+		return "to_do"
+	}
+	return key
+}
+
+// deriveParentStatus is the status equivalent of leafProgressForStatus's
+// progress rule, applied to a parent's direct children (already resolved to
+// their own EFFECTIVE status — a nested parent contributes its own derived
+// status, not its raw stored one). Priority (highest first): Blocked >
+// In Review > In Progress > Done > To Do. A child counts toward "Done" if
+// its own status is done OR its effective progress is 100 (matches the
+// leaf rule where in_review can already sit at 100) — Done only fires once
+// EVERY child qualifies that way, never partially.
+func deriveParentStatus(children []taskProgress) string {
+	total := len(children)
+	if total == 0 {
+		return "to_do"
+	}
+	var blocked, review, inProgress, complete int
+	for _, c := range children {
+		switch c.Status {
+		case "blocked":
+			blocked++
+		case "in_review":
+			review++
+		case "in_progress":
+			inProgress++
+		}
+		if c.Status == "done" || c.Progress >= 100 {
+			complete++
+		}
+	}
+	switch {
+	case blocked > 0:
+		return "blocked"
+	case review > 0:
+		return "in_review"
+	case inProgress > 0:
+		return "in_progress"
+	case complete == total:
+		return "done"
+	default:
+		return "to_do"
+	}
+}
+
+// projectIDFromRow reads crm_project_id out of a DB-scanned model.Row —
+// same toInt64-first-then-int64FromAny fallback already used by
+// logTaskFieldChanges, since the driver can hand this back as a native
+// int64 (toInt64) or, less commonly, something int64FromAny (float64/
+// string) can parse instead.
+func projectIDFromRow(row model.Row) int64 {
+	if id, ok := toInt64(row["crm_project_id"]); ok && id != 0 {
+		return id
+	}
+	return int64FromAny(row["crm_project_id"], 0)
+}
+
+// progressPctFromRow reads progress_pct out of a DB-scanned model.Row.
+// Postgres smallint columns typically arrive as int64 via database/sql, but
+// this tolerates int32/float64/string too rather than assuming one driver
+// behavior.
+func progressPctFromRow(v interface{}) int64 {
+	if n, ok := toInt64(v); ok {
+		return clampPercent(n)
+	}
+	switch n := v.(type) {
+	case float64:
+		return clampPercent(int64(n))
+	case string:
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+			return clampPercent(i)
+		}
+	}
+	return 0
+}
+
+// leafProgressForStatus is the single rule table for how a LEAF task's
+// progress reacts to its status — shared by task create, task update, and
+// Kanban drag-move, so the three can never diverge from each other.
+// manualProgress is a value the caller explicitly wants to set on this call
+// (nil if none, e.g. a plain drag-move never carries one); prevProgress is
+// the task's progress before this change.
+//
+//	to_do       -> always 0
+//	done        -> always 100 ('completed' is treated as a synonym)
+//	blocked     -> never auto-advances; only a genuine manual edit changes it
+//	in_review   -> floors at 90 (never lowers an already-higher value)
+//	in_progress -> 10 if it was 0, otherwise left alone
+//	anything else -> manual value if given, else unchanged
+func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress *int64) int64 {
+	base := prevProgress
+	if manualProgress != nil {
+		base = clampPercent(*manualProgress)
+	}
+	switch strings.ToLower(strings.TrimSpace(statusKey)) {
+	case "to_do":
+		return 0
+	case "done", "completed":
+		return 100
+	case "blocked":
+		return base
+	case "in_review":
+		if base < 90 {
+			return 90
+		}
+		return base
+	case "in_progress":
+		if base == 0 {
+			return 10
+		}
+		return base
+	default:
+		return base
+	}
+}
+
+// computeTaskProgress derives every task's EFFECTIVE progress AND status
+// bottom-up: leaves come from leafProgressForStatus (progress) and their own
+// stored status (normalized); a task with active children gets the rounded
+// average of its children's own effective progress (leafProgressForStatus's
+// "recursive" case) and deriveParentStatus's priority rule over its
+// children's own effective status — computed recursively so nested subtasks
+// fold correctly however deep the tree goes. `tasks` should be every active
+// task sharing a scope (one project, or all projects at once for the list
+// endpoint) — this is one pass over an already-fetched slice, never an extra
+// query per task. A malformed/cyclic parent_task_id chain (never seen in
+// practice) falls back to that task's own stored progress/status instead of
+// recursing forever.
+func computeTaskProgress(tasks []model.Row) map[string]taskProgress {
+	childrenOf := make(map[string][]string, len(tasks))
+	byID := make(map[string]model.Row, len(tasks))
+	for _, t := range tasks {
+		id := str(t["id"])
+		byID[id] = t
+		if pid := str(t["parent_task_id"]); pid != "" {
+			childrenOf[pid] = append(childrenOf[pid], id)
+		}
+	}
+
+	result := make(map[string]taskProgress, len(tasks))
+	visiting := make(map[string]bool, len(tasks))
+
+	var resolve func(id string) taskProgress
+	resolve = func(id string) taskProgress {
+		if r, ok := result[id]; ok {
+			return r
+		}
+		t, known := byID[id]
+		if !known {
+			return taskProgress{Status: "to_do"}
+		}
+		if visiting[id] {
+			return taskProgress{
+				Progress: progressPctFromRow(t["progress_pct"]),
+				Status:   normalizeTaskStatusKey(str(t["status"])),
+			}
+		}
+		visiting[id] = true
+		kids := childrenOf[id]
+		if len(kids) == 0 {
+			p := leafProgressForStatus(str(t["status"]), progressPctFromRow(t["progress_pct"]), nil)
+			tp := taskProgress{Progress: p, Status: normalizeTaskStatusKey(str(t["status"])), IsParent: false}
+			result[id] = tp
+			visiting[id] = false
+			return tp
+		}
+		var sum int64
+		children := make([]taskProgress, 0, len(kids))
+		for _, kid := range kids {
+			c := resolve(kid)
+			sum += c.Progress
+			children = append(children, c)
+		}
+		avg := (sum + int64(len(kids))/2) / int64(len(kids)) // round-half-up
+		tp := taskProgress{Progress: avg, Status: deriveParentStatus(children), IsParent: true}
+		result[id] = tp
+		visiting[id] = false
+		return tp
+	}
+
+	for id := range byID {
+		resolve(id)
+	}
+	return result
+}
+
+// statusMeta mirrors the frontend's KANBAN_COLS (title-cased label per
+// status key) so a parent task's overridden status carries a correct
+// display title even though it never went through the pm_task_statuses
+// join that set the ORIGINAL status_title/status_color on the row.
+var statusMeta = map[string]struct{ Title, Color string }{
+	"to_do":       {"To Do", "#F9A52D"},
+	"in_progress": {"In progress", "#1672B9"},
+	"in_review":   {"In Review", "#6f42c1"},
+	"blocked":     {"Blocked", "#D63939"},
+	"done":        {"Done", "#00A679"},
+}
+
+// applyTaskProgress overrides tasks' progress_pct/status in place with their
+// computed effective values and tags each with has_active_subtasks (so the
+// frontend can disable manual editing for parent tasks), then returns the
+// progress map — also used by callers to derive the owning project's
+// overall progress via projectProgressFromTasks. A parent's status_title/
+// status_color are overridden alongside status/status_key so the frontend's
+// badge (which prefers status_title when present) never shows a stale label
+// next to the new derived status.
+func applyTaskProgress(tasks []model.Row) map[string]taskProgress {
+	progress := computeTaskProgress(tasks)
+	for _, t := range tasks {
+		id := str(t["id"])
+		p := progress[id]
+		t["progress_pct"] = p.Progress
+		t["has_active_subtasks"] = p.IsParent
+		if p.IsParent {
+			t["status"] = p.Status
+			t["status_key"] = p.Status
+			if meta, ok := statusMeta[p.Status]; ok {
+				t["status_title"] = meta.Title
+				t["status_color"] = meta.Color
+			}
+		}
+	}
+	return progress
+}
+
+// projectProgressFromTasks is the project-level progress rule: average
+// effective progress of ROOT tasks (parent_task_id empty) only — subtasks
+// are already folded into their parent's own effective value by
+// computeTaskProgress, so averaging every task directly would double-count
+// them. When no task has a parent at all, every task IS a root, so this
+// reduces exactly to "average of all active tasks" — the documented
+// no-hierarchy fallback. Zero active tasks -> 0.
+func projectProgressFromTasks(tasks []model.Row, progress map[string]taskProgress) int64 {
+	var sum, count int64
+	for _, t := range tasks {
+		if str(t["parent_task_id"]) != "" {
+			continue
+		}
+		sum += progress[str(t["id"])].Progress
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	return (sum + count/2) / count
 }
 
 func parseDateTime(v *string) *time.Time {
@@ -1084,10 +2708,7 @@ func dateOrUnset(v string) string {
 // tracked field — matches the granular examples in the spec ("changed status
 // from To Do to In progress") rather than one noisy combined entry.
 func (s *pmService) logTaskFieldChanges(taskID string, before, after model.Row, actorUserID *int64, actorName string) {
-	projectID, _ := toInt64(before["crm_project_id"])
-	if projectID == 0 {
-		projectID = int64FromAny(before["crm_project_id"], 0)
-	}
+	projectID := projectIDFromRow(before)
 	for _, field := range taskActivityFields {
 		oldVal := field.value(before)
 		newVal := field.value(after)
