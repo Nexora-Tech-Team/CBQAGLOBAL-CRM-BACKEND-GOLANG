@@ -2387,15 +2387,32 @@ func progressPctFromRow(v interface{}) int64 {
 // the task's progress before this change.
 //
 //	to_do       -> always 0
-//	done        -> always 100 ('completed' is treated as a synonym)
-//	blocked     -> never auto-advances; only a genuine manual edit changes it
-//	in_review   -> floors at 90 (never lowers an already-higher value)
-//	in_progress -> 10 if it was 0, otherwise left alone
-//	anything else -> manual value if given, else unchanged
+//	done        -> always 100 ('completed' is treated as a synonym) — the
+//	               ONLY status allowed to show 100%
+//	blocked     -> never auto-advances; only a genuine manual edit changes
+//	               it, but still can't stay at 100 (see capBelowDone below)
+//	in_review   -> pinned to the 90-99 band: floors at 90, and snaps back
+//	               down to 90 (not just capped) if it arrives here already
+//	               at/above 100 — e.g. a Done task sent back to review reads
+//	               as "back under review" (90), not "basically done" (99)
+//	in_progress -> 10 if it was 0, otherwise left alone but capped below 100
+//	anything else -> manual value if given, else unchanged, capped below 100
+//
+// Regressing a task's status AWAY from Done must never leave it silently
+// reporting 100% — that reads as "done" everywhere else in the UI (KPI
+// cards, progress bars) regardless of the status label next to it. Bug:
+// Done (100%) -> In Review used to stay at 100% because in_review only
+// enforced a floor, never a ceiling, on the leftover prevProgress.
 func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress *int64) int64 {
 	base := prevProgress
 	if manualProgress != nil {
 		base = clampPercent(*manualProgress)
+	}
+	capBelowDone := func(v int64) int64 {
+		if v >= 100 {
+			return 99
+		}
+		return v
 	}
 	switch strings.ToLower(strings.TrimSpace(statusKey)) {
 	case "to_do":
@@ -2403,9 +2420,9 @@ func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress 
 	case "done", "completed":
 		return 100
 	case "blocked":
-		return base
+		return capBelowDone(base)
 	case "in_review":
-		if base < 90 {
+		if base < 90 || base >= 100 {
 			return 90
 		}
 		return base
@@ -2413,9 +2430,9 @@ func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress 
 		if base == 0 {
 			return 10
 		}
-		return base
+		return capBelowDone(base)
 	default:
-		return base
+		return capBelowDone(base)
 	}
 }
 
