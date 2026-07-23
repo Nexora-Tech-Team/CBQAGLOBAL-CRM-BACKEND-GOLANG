@@ -46,9 +46,13 @@ if [ -d "$SRC_DIR/migrate" ] && [ -f "$DB_ENV_FILE" ]; then
   fi
 fi
 
-# 3. Swap binary and restart.
-cp "$SRC_DIR/erp-cbqa-global" "$BIN_PATH"
-chmod +x "$BIN_PATH"
+# 3. Swap binary and restart. Copy to a temp file then rename into place —
+# an in-place overwrite (cp truncating the target) fails with "Text file
+# busy" while the old binary is still running.
+TMP_BIN="$BIN_PATH.new"
+cp "$SRC_DIR/erp-cbqa-global" "$TMP_BIN"
+chmod +x "$TMP_BIN"
+mv "$TMP_BIN" "$BIN_PATH"
 systemctl restart "$SERVICE_NAME"
 
 # 4. Health-check with retries.
@@ -64,8 +68,9 @@ done
 echo "Health check FAILED after retries — rolling back."
 LATEST_BACKUP="$(ls -1t "$BACKUP_DIR"/erp-cbqa-global.* 2>/dev/null | head -1 || true)"
 if [ -n "$LATEST_BACKUP" ]; then
-  cp "$LATEST_BACKUP" "$BIN_PATH"
-  chmod +x "$BIN_PATH"
+  cp "$LATEST_BACKUP" "$TMP_BIN"
+  chmod +x "$TMP_BIN"
+  mv "$TMP_BIN" "$BIN_PATH"
   systemctl restart "$SERVICE_NAME"
   sleep 3
   if curl -sf -o /dev/null "$HEALTH_URL"; then
