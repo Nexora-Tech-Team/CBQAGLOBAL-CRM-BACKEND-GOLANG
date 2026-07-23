@@ -26,6 +26,17 @@ This service only owns PM — everything else lives in the Java backend.
 
 ---
 
+## PM Timesheet source of truth (2026-07-23)
+The PM Timesheet endpoint GET /api/v1/pm/timesheets must read from pm_task_time_logs,
+not the legacy pm_timesheets table. The task drawer Work Logs, dashboard active sessions, and
+Timesheet page now share the same source of truth: realtime Clock In/Clock Out rows and manual
+work logs in pm_task_time_logs. Repository Timesheets joins pm_task_time_logs to pm_project_tasks,
+projects/leads/companies, and users to return task/subtask, parent task, project title, member,
+start/end, duration_seconds, source, and note. Cast rounded hour values to float8 in SQL so JSON
+contains numbers (e.g. 0.38) instead of PostgreSQL numeric bytes/base64 from model.Row scanning.
+If /pm/timesheet is empty while a task drawer shows logs, restart/deploy this Go service first;
+that symptom usually means an old process is still serving the old pm_timesheets query.
+
 ## Two "PM projects" concepts — don't confuse them
 
 - **Legacy `pm_projects` table** (the "Library" module) — independent

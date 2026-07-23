@@ -1170,30 +1170,46 @@ func (r *repository) Timesheets(search string, userID, crmProjectID *int64, stat
 	var rows []model.Row
 	err := r.DB.Raw(`
 		SELECT
-		  ts.id, ts.crm_project_id, ts.task_id, ts.user_id, ts.work_date, ts.hours,
-		  ts.description, ts.status, ts.approved_by, ts.approved_at, ts.created_at, ts.updated_at,
+		  tl.id,
+		  tl.project_id AS crm_project_id,
+		  tl.task_id::text AS task_id,
+		  tl.user_id,
+		  tl.started_at::date AS work_date,
+		  ROUND((COALESCE(tl.duration_seconds, GREATEST(0, EXTRACT(EPOCH FROM (NOW() - tl.started_at)))::bigint)::numeric / 3600), 2)::float8 AS hours,
+		  tl.note AS description,
+		  tl.source AS status,
+		  tl.source,
+		  tl.started_at,
+		  tl.ended_at,
+		  COALESCE(tl.duration_seconds, GREATEST(0, EXTRACT(EPOCH FROM (NOW() - tl.started_at)))::bigint) AS duration_seconds,
+		  tl.created_at,
+		  tl.updated_at,
 		  COALESCE(l.project_name, c.company_name) AS project_title,
-		  TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS member_name,
-		  t.title AS task_title
-		FROM pm_timesheets ts
-		LEFT JOIN projects p ON p.id = ts.crm_project_id
+		  NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS member_name,
+		  t.title AS task_title,
+		  CASE WHEN t.parent_task_id IS NULL THEN 'task' ELSE 'subtask' END AS task_type,
+		  pt.title AS parent_task_title
+		FROM pm_task_time_logs tl
+		LEFT JOIN pm_project_tasks t ON t.id = tl.task_id
+		LEFT JOIN pm_project_tasks pt ON pt.id = t.parent_task_id
+		LEFT JOIN projects p ON p.id = COALESCE(tl.project_id, t.crm_project_id)
 		LEFT JOIN leads l ON l.id = p.lead_id
 		LEFT JOIN companies c ON c.id = l.company_id
-		LEFT JOIN users u ON u.id = ts.user_id
-		LEFT JOIN pm_project_tasks t ON t.id = ts.task_id
-		WHERE ts.deleted = FALSE
-		  AND (?::bigint IS NULL OR ts.user_id = ?)
-		  AND (?::bigint IS NULL OR ts.crm_project_id = ?)
-		  AND (?::text IS NULL OR ts.status = ?)
-		  AND (?::date IS NULL OR ts.work_date >= ?::date)
-		  AND (?::date IS NULL OR ts.work_date <= ?::date)
+		LEFT JOIN users u ON u.id = tl.user_id
+		WHERE tl.deleted_at IS NULL
+		  AND (?::bigint IS NULL OR tl.user_id = ?)
+		  AND (?::bigint IS NULL OR COALESCE(tl.project_id, t.crm_project_id) = ?)
+		  AND (?::text IS NULL OR tl.source = ?)
+		  AND (?::date IS NULL OR tl.started_at::date >= ?::date)
+		  AND (?::date IS NULL OR tl.started_at::date <= ?::date)
 		  AND (?::text IS NULL
 		       OR LOWER(COALESCE(l.project_name, c.company_name, '')) LIKE ?
 		       OR LOWER(COALESCE(t.title, '')) LIKE ?
-		       OR LOWER(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, ''))) LIKE ?)
-		ORDER BY ts.work_date DESC, ts.id DESC
+		       OR LOWER(COALESCE(pt.title, '')) LIKE ?
+		       OR LOWER(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '')) LIKE ?)
+		ORDER BY tl.started_at DESC, tl.id DESC
 		LIMIT 500
-	`, userID, userID, crmProjectID, crmProjectID, st, st, from, from, to, to, s, s, s, s).Scan(&rows).Error
+	`, userID, userID, crmProjectID, crmProjectID, st, st, from, from, to, to, s, s, s, s, s).Scan(&rows).Error
 	return rows, err
 }
 
@@ -1201,12 +1217,12 @@ func (r *repository) TimesheetSummary(userID *int64) (model.Row, error) {
 	var rows []model.Row
 	err := r.DB.Raw(`
 		SELECT
-		  COALESCE(SUM(hours) FILTER (WHERE work_date = CURRENT_DATE), 0) AS hours_today,
-		  COALESCE(SUM(hours) FILTER (WHERE work_date >= date_trunc('week', CURRENT_DATE)::date), 0) AS weekly_hours,
-		  COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
-		  COUNT(*) FILTER (WHERE status = 'approved') AS approved_count
-		FROM pm_timesheets
-		WHERE deleted = FALSE
+		  ROUND((COALESCE(SUM(duration_seconds) FILTER (WHERE started_at::date = CURRENT_DATE), 0)::numeric / 3600), 2)::float8 AS hours_today,
+		  ROUND((COALESCE(SUM(duration_seconds) FILTER (WHERE started_at::date >= date_trunc('week', CURRENT_DATE)::date), 0)::numeric / 3600), 2)::float8 AS weekly_hours,
+		  COUNT(*) FILTER (WHERE ended_at IS NULL) AS pending_count,
+		  COUNT(*) FILTER (WHERE ended_at IS NOT NULL) AS approved_count
+		FROM pm_task_time_logs
+		WHERE deleted_at IS NULL
 		  AND (?::bigint IS NULL OR user_id = ?)
 	`, userID, userID).Scan(&rows).Error
 	if err != nil {
