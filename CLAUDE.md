@@ -517,45 +517,66 @@ plan window has already started) — no `Blocked` example in the current
 dataset, but the same-signal logic as `DashboardSummary`'s already-verified
 Health tallies.
 
-## `leafProgressForStatus` — confirmed rule table, an over-broad "fix" reverted (2026-07-23)
+## `leafProgressForStatus` — final confirmed rule table, after 2 correction rounds (2026-07-23)
 
 A Done → In Review transition was reported showing `progress_pct: 100`
 still, on task `Collect Document` (project 994) via the Task Detail
-drawer's Edit form. First attempt "fixed" this by forcing 100% to be
-exclusive to Done/Completed — `in_review` snapping to exactly 90 whenever
-it arrived at/above 100, plus a `capBelowDone` guard (100 → 99) added to
-`blocked`/`in_progress`/`default` too. **That guard was wrong and has been
-reverted** — the user corrected it immediately after: a Done → In Progress
-transition then showed 99% instead of staying unchanged, which isn't part
-of the actual product rule.
+drawer's Edit form. This function went through three revisions the same
+day before landing on the rule actually wanted — recorded here so the next
+change doesn't repeat the same back-and-forth:
 
-**Confirmed rule table** (matches the function's original, pre-"fix" logic
-exactly — see the doc comment on `leafProgressForStatus`):
+1. **First attempt**: forced 100% to be exclusive to Done/Completed —
+   `in_review` snapping to 90 whenever it arrived at/above 100, plus a
+   blanket cap (100 → 99) on `blocked`/`in_progress`/`default` too. Wrong:
+   broke Done → In Progress (showed 99% instead of the expected 100%) and
+   would have broken Done → Blocked the same way.
+2. **First revert**: back to the function's original logic — `in_progress`
+   and `in_review` both pure floors that never lower an already-higher
+   value, `blocked` never touched. Matched the user's own stated rule
+   table at the time... except it turned out that rule table's wording
+   ("in_progress: 10 if it was 0, otherwise unchanged") was ambiguous about
+   the specific Done → In Progress case, and once tested live the user
+   confirmed the *actual* wanted behavior differs from a pure floor for two
+   of the five statuses.
+3. **Final, confirmed via explicit per-transition questions** (not
+   inferred from a general rule restated in words a second time):
 
 ```
-To Do        -> 0%
-In Progress  -> if still 0%, becomes 10%; otherwise unchanged
-In Review    -> floors at 90% (never lowers an already-higher value)
-Done         -> 100%
-Blocked      -> progress unchanged, full stop
+Done (100%) -> In Review     => 90%   (reset to the review floor)
+Done (100%) -> In Progress   => 10%   (reset exactly like a fresh task)
+Done (100%) -> Blocked       => 100%  (unchanged — Blocked carries no
+                                        progress signal of its own)
 ```
 
-Under this table, a task can legitimately show 100% under a non-Done status
-if that's what it was carrying over (e.g. Done → In Progress or Done →
-Blocked keep 100% — expected, not a bug). Whether Done → In Review
-specifically should also retain 100% (pure floor) or reset was the open
-question from the original report; **not backend logic** turned out to be
-the likely explanation there — live staging data showed that exact task
-already at `progress_pct: 90` even before either backend change existed,
-which only happens if the Task Detail drawer's Edit form sends an explicit
-manual `progressPct` alongside the status change (client-side mirrors this
-same floor for its own input UX) rather than relying on the backend's
-status-only rule. If "still shows 100% after Save" recurs, check the
-frontend Edit form's request payload and/or the drawer's post-save refresh
-before touching this function again — see the frontend repo's `CLAUDE.md`
-`PmProjectDetail` notes for the Edit form / `onSave` flow.
+Generalized into the full table now in the function's doc comment:
+
+```
+To Do        -> always 0%
+In Progress  -> 10% if it was 0% OR already 100% (fresh start OR
+                regressing from Done are treated the same way);
+                otherwise left unchanged (an interrupted/resumed task
+                keeps its in-between progress, e.g. 45% stays 45%)
+In Review    -> floors at 90%; ALSO snaps down to 90% if it arrives here
+                already at/above 100% (same regressing-from-Done case)
+Done         -> always 100%
+Blocked      -> NEVER changes progress, not even from Done — pure
+                "work is stuck" marker, no progress semantics of its own
+```
+
+**The key distinction that took three passes to nail down**: `blocked`
+truly never touches progress (confirmed twice), while `in_progress` and
+`in_review` both got an explicit *additional* condition — `base >= 100` —
+alongside their existing floor/reset-from-zero condition. A prior
+in-between value (say 45% or 95%) is still left alone in both; only
+exactly-100-carried-over-from-Done triggers the reset. Don't re-derive this
+rule from prose again if it comes up a third time — ask for the exact
+number per Done → X transition like the final round did, since a
+restated-in-words rule table has already proven ambiguous once here.
 
 No test file exists for this package yet (checked — `domain/pm/service` has
-no `_test.go`); both the original report and this revert were verified via
-code trace (`go build`/`go vet`), not a live write against the shared
-staging DB, to avoid mutating real project data for a manual test.
+no `_test.go`); all three revisions were verified via code trace plus
+`go build`/`go vet`, never a live write against the shared staging DB, to
+avoid mutating real project data for a manual test. A quick manual
+smoke-test in the actual UI (Task Detail drawer → Edit → change status from
+Done to each of In Review / In Progress / Blocked, confirm the % shown)
+would close the loop the code trace alone can't.

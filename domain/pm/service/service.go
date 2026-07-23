@@ -2384,22 +2384,32 @@ func progressPctFromRow(v interface{}) int64 {
 // Kanban drag-move, so the three can never diverge from each other.
 // manualProgress is a value the caller explicitly wants to set on this call
 // (nil if none, e.g. a plain drag-move never carries one); prevProgress is
-// the task's progress before this change. Confirmed rule table (2026-07-23):
+// the task's progress before this change. Confirmed rule table (2026-07-23,
+// second pass — see below for what changed from the first confirmation):
 //
 //	to_do       -> always 0
-//	in_progress -> 10 if it was 0, otherwise unchanged
-//	in_review   -> floors at 90 (never lowers an already-higher value)
+//	in_progress -> 10 if it was 0 OR already 100 (i.e. regressing from
+//	               Done resets it exactly like a fresh start), otherwise
+//	               left unchanged (an interrupted-and-resumed task keeps
+//	               its in-between progress)
+//	in_review   -> floors at 90; ALSO snaps down to 90 if it arrives here
+//	               already at/above 100 (regressing from Done), not just
+//	               left at 100 — "under review" must never look identical
+//	               to "done"
 //	done        -> always 100 ('completed' is treated as a synonym)
-//	blocked     -> never auto-advances; only a genuine manual edit changes it
+//	blocked     -> NEVER changes progress, not even when regressing from
+//	               Done — it's a pure "work is stuck" marker, carries no
+//	               progress signal of its own
 //	anything else -> manual value if given, else unchanged
 //
-// A previous revision of this function also forced blocked/in_progress/
-// in_review down below 100 whenever a task arrived here still carrying its
-// old Done-era 100%, on the assumption 100% should be exclusive to Done —
-// reverted (2026-07-23) because it isn't part of the actual spec above and
-// visibly regressed Done -> In Progress (showed 99% instead of staying
-// unchanged). If a task shows 100% under a non-Done status after this, that
-// is expected per this rule table, not a bug in this function.
+// History: an earlier revision force-capped every non-Done status below
+// 100 (including blocked) — reverted same day because it broke Done ->
+// In Progress (should stay 100 per the FIRST confirmation) and Done ->
+// Blocked (should stay 100, confirmed above). Turned out both of those
+// were right to revert, but Done -> In Progress needed its own explicit
+// reset rule too (confirmed in this second pass: 10%, not "unchanged") —
+// the first confirmation's "otherwise unchanged" wording didn't actually
+// cover the from-Done case, only the general in-between-progress case.
 func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress *int64) int64 {
 	base := prevProgress
 	if manualProgress != nil {
@@ -2413,12 +2423,12 @@ func leafProgressForStatus(statusKey string, prevProgress int64, manualProgress 
 	case "blocked":
 		return base
 	case "in_review":
-		if base < 90 {
+		if base < 90 || base >= 100 {
 			return 90
 		}
 		return base
 	case "in_progress":
-		if base == 0 {
+		if base == 0 || base >= 100 {
 			return 10
 		}
 		return base
