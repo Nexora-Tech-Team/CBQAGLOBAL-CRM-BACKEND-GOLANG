@@ -459,3 +459,60 @@ Progress > Planning), same trigger condition, label only. See the frontend
 repo's `CLAUDE.md` for the matching `PROJECT_STAGES`/`normalizeStageLabel`
 change (the latter rewrites any lingering `'Fieldwork'` value read-time, so
 a stale cached response never surfaces the retired label).
+
+## `CrmProjects` (the `/pm/projects` list) now computes real Health (2026-07-23)
+
+`GET /api/v1/pm/crm-projects` previously never set a `health` field at all —
+the frontend's `normalizeProject()` fell back through
+`project.health || project.statusHealth || project.projectHealth ||
+project.status`, and since none of the first three ever existed, every row
+silently showed the raw CRM `projects.status` integer (always `2` for every
+PM-linked project, since that's the "Won"/converted status code) with a
+default green badge. Not a frontend bug — the list endpoint just never
+computed Health, unlike `DashboardSummary` which always has.
+
+**Fix**: `CrmProjects` (repository + service) now computes Health the exact
+same way `DashboardSummary` does, via a new shared function,
+**`deriveProjectHealth(stage, blockedTasks, overdueTaskCount, planEndPassed,
+actualProgress, plannedProgress) string`** (`service.go`) — Blocked > At
+Risk > Healthy:
+- **Blocked**: any active task is blocked, or Stage is already `"Blocked"`.
+- **At Risk**: any task is overdue, OR the plan window's end date has
+  already passed while Stage isn't `"Completed"`, OR actual progress (real
+  task completion %) is behind planned progress (where the plan window's
+  start/end date says the project should be by now — see
+  `planProgressPercent`).
+- **Healthy**: none of the above.
+
+`DashboardSummary`'s own inline health `switch` (previously duplicated
+inline) was refactored to call `deriveProjectHealth` too, so the two
+surfaces structurally cannot drift apart again.
+
+**Wiring**: `CrmProjects`' repository SQL gained `blocked_tasks` (from the
+already-joined `taskStageJoinSQL`'s `task_stage` aggregate — was joined but
+never selected) and `plan_start`/`plan_end` (via `planWindowJoinSQL`, same
+COALESCE-to-`project_date`/`valid_until` fallback `PmPortfolioProjects`
+already uses for brand-new Planning projects with no tasks yet). The
+service layer switched its per-project task source from
+`ActiveTaskProgressInputs()` to **`PmPortfolioTasks()`** — Health's overdue
+check needs each task's `deadline`, which `ActiveTaskProgressInputs` never
+selected (it only has `id`/`crm_project_id`/`parent_task_id`/`status`/
+`progress_pct`, enough for progress but not for overdue detection).
+`ActiveTaskProgressInputs` itself is left in place (still compiles, no
+other caller currently, but not worth deleting for a one-line savings).
+
+**Scope note**: only the **list** endpoint (`CrmProjects`) was fixed, since
+that's what `/pm/projects` calls and what was reported. `CrmProjectByID`
+(`/pm/projects/{id}` detail page) has the exact same gap — its `health`
+field is likewise never set by that query — but was deliberately left
+alone; fix it the same way (add `blocked_tasks`/`plan_start`/`plan_end` to
+its SQL, compute via `deriveProjectHealth` in `CrmProjectDetail`) if the
+detail page's Health badge needs the same treatment.
+
+Verified against the shared staging DB (2026-07-23): before the fix, every
+row returned `status: 2` and no `health` key at all; after, real projects
+resolved to `Healthy` (e.g. project 994, all tasks on track) and `At Risk`
+(e.g. project 827, several Planning-stage projects with no tasks yet whose
+plan window has already started) — no `Blocked` example in the current
+dataset, but the same-signal logic as `DashboardSummary`'s already-verified
+Health tallies.

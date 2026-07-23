@@ -594,6 +594,9 @@ func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 		  pm.pic_user_id,
 		  NULLIF(TRIM(COALESCE(pu.first_name, '') || ' ' || COALESCE(pu.last_name, '')), '') AS pic,
 		  `+taskStageCaseSQL+`,
+		  COALESCE(task_stage.blocked_tasks, 0) AS blocked_tasks,
+		  COALESCE(plan_window.min_start_date, p.project_date) AS plan_start,
+		  COALESCE(plan_window.max_deadline, p.valid_until) AS plan_end,
 		  GREATEST(
 		    p.updated_at,
 		    (SELECT MAX(t.updated_at) FROM pm_project_tasks t WHERE t.crm_project_id = p.id AND t.deleted = FALSE)
@@ -608,6 +611,7 @@ func (r *repository) CrmProjects(search string) ([]model.Row, error) {
 		LEFT JOIN pm_projects pm ON pm.crm_project_id = p.id AND pm.deleted = FALSE
 		LEFT JOIN users pu ON pu.id = pm.pic_user_id
 		`+taskStageJoinSQL+`
+		`+planWindowJoinSQL+`
 		WHERE s.name IN ('Advisory', 'Audit Program')
 		  AND (?::text IS NULL
 		       OR LOWER(COALESCE(l.project_name, c.company_name)) LIKE ?

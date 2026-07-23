@@ -380,10 +380,14 @@ func (s *pmService) CrmProjects(search string) ([]model.Row, error) {
 	// One extra flat query for every active task across every project,
 	// grouped in memory by crm_project_id — the alternative (fetch tasks
 	// per project row) is exactly the N+1 pattern this needs to avoid.
-	tasks, err := s.Repository.ActiveTaskProgressInputs()
+	// PmPortfolioTasks (not the narrower ActiveTaskProgressInputs) is used
+	// here because Health's overdue check needs each task's `deadline`,
+	// which ActiveTaskProgressInputs doesn't select.
+	tasks, err := s.Repository.PmPortfolioTasks()
 	if err != nil {
 		for _, row := range rows {
 			row["progress"] = int64(0)
+			row["health"] = "Healthy"
 		}
 		return rows, nil
 	}
@@ -392,10 +396,29 @@ func (s *pmService) CrmProjects(search string) ([]model.Row, error) {
 		pid, _ := toInt64(t["crm_project_id"])
 		tasksByProject[pid] = append(tasksByProject[pid], t)
 	}
+	now := time.Now()
 	for _, row := range rows {
 		pid, _ := toInt64(row["crm_project_id"])
 		projectTasks := tasksByProject[pid]
-		row["progress"] = projectProgressFromTasks(projectTasks, computeTaskProgress(projectTasks))
+		actualProgress := projectProgressFromTasks(projectTasks, computeTaskProgress(projectTasks))
+		row["progress"] = actualProgress
+
+		stage := str(row["stage"])
+		blockedTasks, _ := toInt64(row["blocked_tasks"])
+		plannedProgress := planProgressPercent(timeFromRow(row["plan_start"]), timeFromRow(row["plan_end"]), now)
+
+		var overdueTaskCount int64
+		for _, t := range projectTasks {
+			if isOverdueTask(t, now) {
+				overdueTaskCount++
+			}
+		}
+		planEndPassed := false
+		if planEnd := timeFromRow(row["plan_end"]); planEnd != nil && isPastCalendarDay(*planEnd, now) {
+			planEndPassed = true
+		}
+
+		row["health"] = deriveProjectHealth(stage, blockedTasks, overdueTaskCount, planEndPassed, actualProgress, plannedProgress)
 	}
 	return rows, nil
 }
@@ -1453,13 +1476,7 @@ func (s *pmService) DashboardSummary() (model.Row, error) {
 			planEndPassed = true
 		}
 
-		health := "Healthy"
-		switch {
-		case blockedTasks > 0 || stage == "Blocked":
-			health = "Blocked"
-		case overdueTaskCount > 0 || (planEndPassed && stage != "Completed") || actualProgress < plannedProgress:
-			health = "At Risk"
-		}
+		health := deriveProjectHealth(stage, blockedTasks, overdueTaskCount, planEndPassed, actualProgress, plannedProgress)
 
 		// Issue priority for Attention Needed: Blocked > Overdue > Behind
 		// plan > No recent update. Only one issue is surfaced per project
@@ -2007,6 +2024,30 @@ func loadStatusForPeriod(activeTasks, overdueTasks int64, hoursLogged float64, p
 // zero/negative-length (can't divide by zero, and a same-day plan window
 // isn't meaningful to interpolate) — a project with no usable plan window
 // simply contributes 0 rather than being excluded from portfolio averages.
+// deriveProjectHealth is the single source of truth for a project's Health
+// status — Blocked > At Risk > Healthy, checked in that order so a project
+// only ever reports its single worst signal. Used by both DashboardSummary
+// (via PmPortfolioProjects) and CrmProjects, so the two list/detail/
+// dashboard surfaces can never disagree about a project's health:
+//   - Blocked: any active task is blocked, or Stage itself is already
+//     "Blocked" (the two are usually the same signal, kept as an OR for
+//     safety in case Stage and the live blocked-task count ever drift).
+//   - At Risk: any task is overdue, OR the plan window's end date has
+//     already passed while the project isn't Completed yet, OR actual
+//     progress (tasks really done) is behind planned progress (where the
+//     plan window's start/end date says it should be by now).
+//   - Healthy: none of the above.
+func deriveProjectHealth(stage string, blockedTasks, overdueTaskCount int64, planEndPassed bool, actualProgress, plannedProgress int64) string {
+	switch {
+	case blockedTasks > 0 || stage == "Blocked":
+		return "Blocked"
+	case overdueTaskCount > 0 || (planEndPassed && stage != "Completed") || actualProgress < plannedProgress:
+		return "At Risk"
+	default:
+		return "Healthy"
+	}
+}
+
 func planProgressPercent(planStart, planEnd *time.Time, now time.Time) int64 {
 	if planStart == nil || planEnd == nil {
 		return 0
