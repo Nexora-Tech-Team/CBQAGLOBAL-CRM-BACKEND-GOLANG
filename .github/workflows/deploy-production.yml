@@ -1,0 +1,75 @@
+name: Deploy Go PM API (production)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: golang-pm-api-deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy to api-pm-prod.cbqaglobal.co.id
+    # PUSH-BASED deploy to the dedicated PM API production box
+    # (72.60.74.36). Separate from build.yml's older pull-based artifact
+    # (targeting 72.60.74.35) — see ops/README.md for both paths.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o erp-cbqa-global .
+
+      - name: Assemble deploy bundle
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp erp-cbqa-global dist/erp-cbqa-global
+          cp ops/deploy-golang-prod.sh dist/deploy-golang-prod.sh
+          if [ -d db/migrate ]; then
+            mkdir -p dist/migrate
+            cp db/migrate/*.sql dist/migrate/ 2>/dev/null || true
+          fi
+          echo "${GITHUB_SHA}" > dist/sha.txt
+          echo "Bundle contents:"; ls -la dist/
+
+      - name: Upload bundle to production server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          password: ${{ secrets.PROD_SSH_PASSWORD }}
+          source: "dist/*"
+          target: "/root/app/golang-pm-prod/incoming"
+          strip_components: 1
+          overwrite: true
+
+      - name: Run remote deploy script
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          password: ${{ secrets.PROD_SSH_PASSWORD }}
+          script_stop: true
+          script: |
+            chmod +x /root/app/golang-pm-prod/incoming/erp-cbqa-global
+            chmod +x /root/app/golang-pm-prod/incoming/deploy-golang-prod.sh
+            bash /root/app/golang-pm-prod/incoming/deploy-golang-prod.sh /root/app/golang-pm-prod/incoming

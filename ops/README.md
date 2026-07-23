@@ -52,7 +52,52 @@ roll back manually, copy the newest file from
 `/root/app/golang-pm-staging/backups/` over `erp-cbqa-global` and
 `systemctl restart cbqaglobal-golang-pm-staging`.
 
-## Production (pull-based deploy)
+## Production — dedicated PM API box (push-based deploy)
+
+Push to `main` → `.github/workflows/deploy-production.yml` builds the binary
+on a GitHub-hosted runner, then pushes it directly to the dedicated PM API
+production box (`72.60.74.36`, `api-pm-prod.cbqaglobal.co.id`) over SSH and
+runs `deploy-golang-prod.sh` there (backup → migrate → swap binary →
+restart → health-check → auto-rollback on failure). This box only hosts
+this API plus the CRM frontend's own prod deploy — no shared-tenancy
+concerns like the staging box above.
+
+**Required GitHub configuration** (Settings → Environments → New environment
+`production`, then add these as environment secrets — never commit them):
+
+| Secret | Value |
+|---|---|
+| `PROD_SSH_HOST` | `72.60.74.36` |
+| `PROD_SSH_USER` | `root` |
+| `PROD_SSH_PASSWORD` | the VPS root password |
+
+One-time server setup (already done for the current box, kept here for
+reference / disaster recovery):
+
+```bash
+apt-get install -y postgresql-client
+mkdir -p /root/app/golang-pm-prod
+# .env seeded from this repo's .env.prod (POSTGRESQL_URL etc. — note the
+# DB itself still lives on 72.60.74.35, this box just runs the API)
+cp ops/cbqaglobal-golang-pm-prod.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now cbqaglobal-golang-pm-prod
+cp ops/nginx-api-pm-prod.cbqaglobal.co.id.conf /etc/nginx/sites-available/api-pm-prod.cbqaglobal.co.id
+ln -s /etc/nginx/sites-available/api-pm-prod.cbqaglobal.co.id /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+certbot --nginx -d api-pm-prod.cbqaglobal.co.id
+```
+
+Verify: `systemctl status cbqaglobal-golang-pm-prod`,
+`curl -s -o /dev/null -w '%{http_code}\n' https://api-pm-prod.cbqaglobal.co.id/api/v1/pm/task-statuses`
+(expect 200). Logs: `tail -f /root/app/golang-pm-prod/service.log`.
+
+Rollback: the deploy script auto-rolls back on a failed health check; to
+roll back manually, copy the newest file from
+`/root/app/golang-pm-prod/backups/` over `erp-cbqa-global` and
+`systemctl restart cbqaglobal-golang-pm-prod`.
+
+## Legacy — shared box pull-based deploy (72.60.74.35)
 
 Mirrors `CBQAGLOBAL-CRM-BACKEND`'s production deploy pattern: push to `main` builds a
 binary on a GitHub-hosted runner and uploads it as an artifact; the VPS
