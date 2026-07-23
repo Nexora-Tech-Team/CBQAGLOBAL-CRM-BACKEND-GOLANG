@@ -517,29 +517,45 @@ plan window has already started) — no `Blocked` example in the current
 dataset, but the same-signal logic as `DashboardSummary`'s already-verified
 Health tallies.
 
-## Bug fix: Done → In Review kept showing 100% progress (2026-07-23)
+## `leafProgressForStatus` — confirmed rule table, an over-broad "fix" reverted (2026-07-23)
 
-`leafProgressForStatus` only enforced a **floor** (minimum 90) for
-`in_review`, never a ceiling — so a task previously marked Done (100%) that
-gets sent back to `in_review` kept reporting `progress_pct: 100`, because
-100 already satisfies "not below 90". Reported live: task `Collect Document`
-(project 994) — status changed Done → In Review via the Task Detail
-drawer's Edit form (`UpdateProjectTask`, no manual `progressPct` in the
-request), progress stayed 100% in the UI.
+A Done → In Review transition was reported showing `progress_pct: 100`
+still, on task `Collect Document` (project 994) via the Task Detail
+drawer's Edit form. First attempt "fixed" this by forcing 100% to be
+exclusive to Done/Completed — `in_review` snapping to exactly 90 whenever
+it arrived at/above 100, plus a `capBelowDone` guard (100 → 99) added to
+`blocked`/`in_progress`/`default` too. **That guard was wrong and has been
+reverted** — the user corrected it immediately after: a Done → In Progress
+transition then showed 99% instead of staying unchanged, which isn't part
+of the actual product rule.
 
-**Fix**: `in_review` now snaps to exactly 90 whenever it arrives already
-at/above 100 (not just capped — regressing from Done reads as "back under
-review", not "basically done"), and `blocked`/`in_progress`/`default` gained
-a `capBelowDone` guard (100 → 99) for the same reason — **100% is now
-exclusive to Done/Completed**, no other status can display it. This is the
-same shared `leafProgressForStatus` used by task create, `UpdateProjectTask`
-(Edit form / any PATCH with a status change), and `MoveProjectTaskByKey`
-(Kanban drag), so the fix applies uniformly across all three entry points,
-not just the Edit-form path that surfaced it.
+**Confirmed rule table** (matches the function's original, pre-"fix" logic
+exactly — see the doc comment on `leafProgressForStatus`):
+
+```
+To Do        -> 0%
+In Progress  -> if still 0%, becomes 10%; otherwise unchanged
+In Review    -> floors at 90% (never lowers an already-higher value)
+Done         -> 100%
+Blocked      -> progress unchanged, full stop
+```
+
+Under this table, a task can legitimately show 100% under a non-Done status
+if that's what it was carrying over (e.g. Done → In Progress or Done →
+Blocked keep 100% — expected, not a bug). Whether Done → In Review
+specifically should also retain 100% (pure floor) or reset was the open
+question from the original report; **not backend logic** turned out to be
+the likely explanation there — live staging data showed that exact task
+already at `progress_pct: 90` even before either backend change existed,
+which only happens if the Task Detail drawer's Edit form sends an explicit
+manual `progressPct` alongside the status change (client-side mirrors this
+same floor for its own input UX) rather than relying on the backend's
+status-only rule. If "still shows 100% after Save" recurs, check the
+frontend Edit form's request payload and/or the drawer's post-save refresh
+before touching this function again — see the frontend repo's `CLAUDE.md`
+`PmProjectDetail` notes for the Edit form / `onSave` flow.
 
 No test file exists for this package yet (checked — `domain/pm/service` has
-no `_test.go`), so verification was via code trace against the exact
-reported input (`prevProgress=100, statusKey="in_review", manualProgress=
-nil` → `base=100` → `base>=100` branch → returns `90`) plus `go build`/`go
-vet` — no live write was made against the shared staging DB to avoid
-mutating real project data for a manual test.
+no `_test.go`); both the original report and this revert were verified via
+code trace (`go build`/`go vet`), not a live write against the shared
+staging DB, to avoid mutating real project data for a manual test.
